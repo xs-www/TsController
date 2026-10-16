@@ -43,8 +43,17 @@
 - [x] `deploy/Dockerfile` + `deploy/docker-compose.yml` + `.dockerignore`；镜像已在本机 Linux 容器构建并跑通（含容器内读宿主 Docker、生成快照、写挂载卷）。
 - [x] `.github/workflows/docker-publish.yml`：tag 推送或手动触发；先跑 `lint` + `test` 再构建；显式把镜像名转小写（ghcr 要求全小写）。
 - [x] `docs/image-publishing.md`：手动推送与 Actions 两条路径、PAT 权限、架构确认、NAS 侧拉取与排查。
-- [ ] **工作流尚未在 GitHub 上真实跑过** —— 仓库目前零提交、无 remote。要走 Actions 这条路，得先落一次提交并建远端仓库（`docs/image-publishing.md` §3.1 有命令）。
+- [x] 首次推送到 <https://github.com/xs-www/TsController>（`main` = `d0e29cd`，59 文件）。
+- [ ] **工作流尚未真实跑过** —— 可以用 `git tag v0.1.0 && git push origin v0.1.0` 触发，或在 Actions 页面手动 Run workflow。
 - [ ] NAS 架构确认：`uname -m`。绿联 DX4600 Pro 及其同代机型应为 x86_64，但**以实际输出为准**——架构错了镜像拉下来会 `exec format error`。
+
+### 2.6 公开仓库里的个人信息（待你决定收尾）
+
+- [x] 已把文档示例与测试夹具里的真实 tailnet 名称、IP、主机名全部替换为占位值（`my-laptop.example-tailnet.ts.net` / `100.101.102.103`），并**改写提交后强推**（`415c65e` → `d0e29cd`），当前 `main` 内容已确认干净。
+- [ ] **旧提交 `415c65e` 仍可按 SHA 访问**：<https://github.com/xs-www/TsController/commit/415c65ecf1d06e2fd27e73fac41a948a2f40a2af>。强推只让它从分支不可达，GitHub 不会立即回收未引用的对象。
+  - 风险定级**低**：泄漏物是 tailnet 名称（公网 NXDOMAIN，经 Cloudflare DoH 核实）与 CGNAT 段 IP（`100.64.0.0/10`，公网不可达），**不含任何凭据**。要进 tailnet 靠成员身份与 ACL，知道名字无用。
+  - 若要**彻底**清除，唯一可靠做法是**删库重建**（仓库刚建、零 fork、零 star，代价为零，URL 不变）：Settings → Danger Zone → Delete this repository → 用同名重建 → `git push -u origin main` 重新推。
+  - 或者接受现状。两种都合理，取决于你对「tailnet 名称公开」的容忍度。
 
 ### 3. 自动收敛循环
 

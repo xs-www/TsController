@@ -723,3 +723,42 @@ Vite 6 + React 19 + TypeScript，无 UI 框架，纯手写 CSS。构建产物 `w
 | workflow YAML 解析（pyyaml） | ✅ `jobs: [verify, build-and-push]`、`triggers: [push, workflow_dispatch]` |
 
 **未验证**：工作流本身未在 GitHub 上真实运行过（需要先把仓库推上去）。
+
+### 2026-10-16 · 首次发布到 GitHub + 公开仓库的个人信息清理
+
+#### 发布
+
+仓库 <https://github.com/xs-www/TsController>（空仓库）→ 首次提交 → `main` 分支。当前 `main` = `d0e29cd`，59 个文件。
+
+- `git remote add origin https://github.com/xs-www/TsController.git`，分支 `master` → `main`
+- 提交前核查：待提交内容里无 `.env` / token / 密钥类文件；`data/` 同时被 `.gitignore` 与 `.dockerignore` 排除
+- `.gitignore` 补充 `vol/`（与 `.dockerignore` 保持一致）
+
+#### 清理（这是本节的重点）
+
+发布后发现**仓库是公开的**，而文档示例与测试夹具里含真实的 tailnet 名称、tailnet IP 与主机名。运行时设计本身没有问题——tailnet 名称是从 `tailscale status --json` 现读的（`parseTailnetInfo`），TsController **不持久化它**，`data/` 里只有映射（路径 + 端口）。泄露纯粹来自「为了写实测证据链而把真实值抄进了文档和夹具」。
+
+处理方式：13 个文件、约 90 处替换，**改写提交后强推**（`415c65e` → `d0e29cd`），而不是补一个提交把旧值留在历史里。
+
+| 原值 | 替换为 |
+| --- | --- |
+| `sisi-laptop` | `my-laptop` |
+| `Sisi-Laptop` | `My-Laptop` |
+| `tail921448` | `example-tailnet` |
+| `100.72.255.29` | `100.101.102.103` |
+| `fd7a:115c:a1e0::2101:ffb9` | `fd7a:115c:a1e0::9999` |
+| `D:\桌面\sisi_apps\TsController` | `D:\apps\TsController` |
+
+注意：`git grep -l <pattern> HEAD` 会给每条路径加 `HEAD:` 前缀，直接拿去 `Resolve-Path` 会全部失败——第一次尝试因此一个字都没改。要用不带 revision 的 `git grep -l` 搜工作区。
+
+**未被强推解决的部分**：旧提交仍可按 SHA 直接访问（GitHub 不立即回收未引用对象）。彻底清除只能删库重建。风险定级**低**——泄漏物是 tailnet 名称（经 Cloudflare DoH 核实公网 NXDOMAIN；注意本机 `Resolve-DnsName -Server 1.1.1.1` 会被 Tailscale 的 DNS 拦截给出假阳性）与 CGNAT 段 IP（不可公网路由），**不含凭据**。决策记在 `todo.md` 2.6。
+
+#### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| 残留扫描（tailnet 名/IP/主机名/个人路径/邮箱） | ✅ 0 处 |
+| 远端 `main` 抽查（README / function-index / fakes） | ✅ 无个人信息 |
+| 中文编码完好性 | ✅（用 .NET `UTF8Encoding($false)` 显式无 BOM 写入） |
+| `npm run lint` | 0 错 |
+| `npm test` | **119/119**（替换保持了夹具自洽性） |
