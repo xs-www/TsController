@@ -249,3 +249,133 @@ describe('管理 API', () => {
     expect(res.statusCode).toBe(200);
   });
 });
+
+describe('管理 API · Service 维度', () => {
+  it('/api/system 报告 tag 身份与 Service 列表', async () => {
+    current = await setup();
+    current.gateway.addService('svc:dsh', [443], true, ['100.65.32.1']);
+    current.gateway.tailnetInfo = { ...current.gateway.tailnetInfo, tags: ['tag:service-host'] };
+
+    const body = (await current.app.inject({ method: 'GET', url: '/api/system' })).json();
+
+    expect(body.magicDnsSuffix).toBe('example-tailnet.ts.net');
+    expect(body.selfTags).toEqual(['tag:service-host']);
+    expect(body.canHostService).toBe(true);
+    expect(body.services).toEqual([
+      {
+        name: 'svc:dsh',
+        dnsName: 'dsh.example-tailnet.ts.net',
+        servePorts: [443],
+        advertised: true,
+        vipIps: ['100.65.32.1'],
+      },
+    ]);
+  });
+
+  it('没有 tag 时 canHostService 为 false（界面据此解释为什么不能承载 Service）', async () => {
+    current = await setup();
+    const body = (await current.app.inject({ method: 'GET', url: '/api/system' })).json();
+    expect(body.selfTags).toEqual([]);
+    expect(body.canHostService).toBe(false);
+  });
+
+  it('通过 API 建立 Service 级远端映射，并在 /api/mappings 与快照里体现', async () => {
+    current = await setup();
+    current.gateway.addService('svc:dsh', [443], true, ['100.65.32.1']);
+
+    const created = await current.app.inject({
+      method: 'POST',
+      url: '/api/mappings',
+      payload: {
+        path: '/',
+        hostPort: 3081,
+        service: 'dsh',
+        remoteHost: 'my-laptop.example-tailnet.ts.net',
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const mapping = created.json().mapping;
+    expect(mapping).toMatchObject({
+      service: 'svc:dsh',
+      path: '/',
+      status: 'active',
+      baseUrl: 'https://dsh.example-tailnet.ts.net',
+      desiredProxy: 'http://my-laptop.example-tailnet.ts.net:3081',
+    });
+    expect(current.gateway.proxyOf('/', 443, 'svc:dsh')).toBe(
+      'http://my-laptop.example-tailnet.ts.net:3081',
+    );
+
+    const list = (await current.app.inject({ method: 'GET', url: '/api/mappings' })).json();
+    expect(list.services.map((s: { name: string }) => s.name)).toEqual(['svc:dsh']);
+    expect(list.selfTags).toEqual([]);
+
+    const routes = (await current.app.inject({ method: 'GET', url: '/api/serve/routes' })).json();
+    expect(routes.services.map((s: { name: string }) => s.name)).toEqual(['svc:dsh']);
+    expect(routes.routes[0]).toMatchObject({ service: 'svc:dsh', managed: true });
+  });
+
+  it('PATCH 可以在节点级与 Service 级之间切换（摘旧挂新）', async () => {
+    current = await setup();
+    current.gateway.addService('svc:dsh', [443], true, []);
+
+    const created = await current.app.inject({
+      method: 'POST',
+      url: '/api/mappings',
+      payload: { path: '/dsh', hostPort: 3081 },
+    });
+    const id = created.json().mapping.id as string;
+    expect(current.gateway.proxyOf('/dsh', 443, null)).toBe('http://127.0.0.1:3081');
+
+    const patched = await current.app.inject({
+      method: 'PATCH',
+      url: `/api/mappings/${id}`,
+      payload: { service: 'svc:dsh', path: '/', remoteHost: 'my-laptop.example-tailnet.ts.net' },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(patched.json().mapping).toMatchObject({ service: 'svc:dsh', path: '/' });
+    expect(current.gateway.proxyOf('/', 443, 'svc:dsh')).toBe(
+      'http://my-laptop.example-tailnet.ts.net:3081',
+    );
+    // 节点级的旧路径被摘除。
+    expect(current.gateway.proxyOf('/dsh', 443, null)).toBeUndefined();
+  });
+
+  it('远端目标只允许 Service 级（409 remote-host-requires-service）', async () => {
+    current = await setup();
+    const res = await current.app.inject({
+      method: 'POST',
+      url: '/api/mappings',
+      payload: { path: '/x', hostPort: 3081, remoteHost: 'my-laptop.example-tailnet.ts.net' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('remote-host-requires-service');
+  });
+
+  it('非法 Service 名返回 409 invalid-service', async () => {
+    current = await setup();
+    const res = await current.app.inject({
+      method: 'POST',
+      url: '/api/mappings',
+      payload: { path: '/', hostPort: 3081, service: 'DSH' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe('invalid-service');
+  });
+
+  it('/api/mappings/import 接受 Service 维度的路由选择', async () => {
+    current = await setup();
+    current.gateway.addService('svc:dsh', [443], true, []);
+    current.gateway.addService('svc:other', [443], true, []);
+    current.gateway.set('/', 'http://127.0.0.1:3081', 443, 'svc:dsh');
+    current.gateway.set('/', 'http://127.0.0.1:8899', 443, 'svc:other');
+
+    const res = await current.app.inject({
+      method: 'POST',
+      url: '/api/mappings/import',
+      payload: { routes: [{ service: 'svc:other', servePort: 443, path: '/' }] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().imported.map((m: { service: string }) => m.service)).toEqual(['svc:other']);
+  });
+});

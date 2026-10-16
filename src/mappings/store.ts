@@ -6,7 +6,13 @@
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { normalizeRoutePath, isValidPort } from '../domain/route-path.ts';
+import {
+  normalizeRoutePath,
+  normalizeServiceName,
+  isValidPort,
+  serveRouteKey,
+  normalizeRemoteHost,
+} from '../domain/route-path.ts';
 import type { AuditEvent, Mapping, MappingTarget, OwnedRoute } from '../domain/types.ts';
 import type { Logger } from '../logger.ts';
 
@@ -25,7 +31,11 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 /** 校验并归一化一条「已占用路由」记录。 */
-function reviveOwnedRoutes(raw: unknown, fallbackPort: number): OwnedRoute[] {
+function reviveOwnedRoutes(
+  raw: unknown,
+  fallbackPort: number,
+  fallbackService: string | null = null,
+): OwnedRoute[] {
   if (!Array.isArray(raw)) return [];
   const out: OwnedRoute[] = [];
   const seen = new Set<string>();
@@ -34,10 +44,15 @@ function reviveOwnedRoutes(raw: unknown, fallbackPort: number): OwnedRoute[] {
     const pathCheck = normalizeRoutePath(typeof item.path === 'string' ? item.path : '');
     if (!pathCheck.ok) continue;
     const port = isValidPort(Number(item.servePort)) ? Number(item.servePort) : fallbackPort;
-    const key = `${port}|${pathCheck.path.toLowerCase()}`;
+    // Service 维度缺失（旧格式）时归属到该映射自身的 Service。
+    const serviceCheck = item.service === undefined
+      ? { ok: true, service: fallbackService }
+      : normalizeServiceName(typeof item.service === 'string' ? item.service : null);
+    if (!serviceCheck.ok) continue;
+    const key = serveRouteKey(serviceCheck.service, port, pathCheck.path);
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({ servePort: port, path: pathCheck.path });
+    out.push({ service: serviceCheck.service, servePort: port, path: pathCheck.path });
   }
   return out;
 }
@@ -50,6 +65,7 @@ function reviveOwnedRoutes(raw: unknown, fallbackPort: number): OwnedRoute[] {
  *
  * `defaultServePort` 用于补全缺失端口（旧格式没有该字段），以及迁移旧的
  * `ownedPaths: string[]`——那时路径没有端口维度，只能归属到映射自己的端口。
+ * Service 维度同理：旧记录一律视为节点级（`service: null`）。
  */
 export function reviveMapping(raw: unknown, defaultServePort: number, logger?: Logger): Mapping | null {
   if (!isRecord(raw)) return null;
@@ -72,26 +88,44 @@ export function reviveMapping(raw: unknown, defaultServePort: number, logger?: L
   const kind: MappingTarget['kind'] = t.kind === 'host' ? 'host' : 'container';
   const targetPath = typeof t.targetPath === 'string' && t.targetPath !== '/' ? t.targetPath : '';
   const target: MappingTarget = { kind, hostPort, targetPath };
+  const remote = normalizeRemoteHost(typeof t.remoteHost === 'string' ? t.remoteHost : null);
+  if (!remote.ok) {
+    logger?.warn('丢弃映射：远端主机名非法', { id, remoteHost: t.remoteHost, reason: remote.reason });
+    return null;
+  }
+  if (remote.host !== null) target.remoteHost = remote.host;
+  if (t.scheme === 'https') target.scheme = 'https';
   if (typeof t.containerId === 'string') target.containerId = t.containerId;
   if (typeof t.containerName === 'string') target.containerName = t.containerName;
   if (Number.isInteger(t.containerPort)) target.containerPort = Number(t.containerPort);
 
+  // 远端目标不可能是本机容器的已发布端口，避免脏数据把两类目标混在一起。
+  if (target.remoteHost !== undefined) delete target.containerId;
+
   const rawPort = Number(raw.servePort);
   const servePort = isValidPort(rawPort) ? rawPort : defaultServePort;
+
+  const serviceCheck = normalizeServiceName(typeof raw.service === 'string' ? raw.service : null);
+  const service = serviceCheck.ok ? serviceCheck.service : null;
+  if (!serviceCheck.ok && raw.service !== undefined && raw.service !== null) {
+    logger?.warn('映射的 Service 名非法，按节点级处理', { id, service: raw.service, reason: serviceCheck.reason });
+  }
 
   // 新格式优先；旧格式的 ownedPaths 没有端口维度，按本映射的端口迁移。
   const ownedRoutes =
     raw.ownedRoutes !== undefined
-      ? reviveOwnedRoutes(raw.ownedRoutes, servePort)
+      ? reviveOwnedRoutes(raw.ownedRoutes, servePort, service)
       : reviveOwnedRoutes(
           Array.isArray(raw.ownedPaths)
             ? raw.ownedPaths.map((p) => ({ path: p, servePort }))
             : [],
           servePort,
+          service,
         );
 
   return {
     id,
+    service,
     path: pathCheck.path,
     servePort,
     target,

@@ -7,15 +7,20 @@
  *   A. serve 中（443）存在指向管理端口的路由 → 启动闸门必须摘除它，并写入审计日志；
  *   B. serve 中存在指向其它端口的路由 → 必须原样保留（不能误伤）；
  *   C. 通过 API 建立指向管理端口的映射 → 必须被拒绝（409 exposes-admin）；
- *   D. **非默认端口上的暴露** → 同样必须被检测并摘除。
+ *   D. **非默认端口上的暴露** → 同样必须被检测并摘除；
+ *   E. **Service 命名空间上的暴露** → 同样必须被检测并摘除（E 段只在传入
+ *      `--service svc:<名字>` 且该 Service 已存在时执行，因为需要真实的 service host）。
  *
  * D 是后加的回归用例：早期实现只解析 443 那一组 Web 配置，挂在 8443 上的暴露
  * 对闸门完全不可见——那是一个真实的安全缺口，这条断言专门守住它。
  *
+ * E 是 Service 支持引入的第二个同类缺口：`serve status --json` **不含 Service**，
+ * 只读它会让 Service 上的暴露对闸门完全不可见。E 段守的就是这条。
+ *
  * 为了做到「零暴露窗口」，泄漏路由在闸门运行前指向一个**无人监听**的端口，
  * 因此被探测到的那一瞬间也不会有任何数据外泄。
  *
- * 用法：node scripts/verify-security.ts
+ * 用法：node scripts/verify-security.ts [--service svc:dsh]
  */
 
 import { promises as fs } from 'node:fs';
@@ -26,6 +31,8 @@ const LEAK_PATH = '/__tsc-leak';
 const SAFE_PATH = '/__tsc-safe';
 const LEAK_PORT = 8443;
 const LEAK_PATH_ALT = '/__tsc-leak-alt';
+/** Service 命名空间的泄漏路径（只在传入 --service 时使用）。 */
+const SERVICE_LEAK_PATH = '/__tsc-leak-svc';
 /** 验证期间临时充当「管理端口」；确认空闲后才会使用。 */
 const TEST_ADMIN_PORT = 8789;
 const DEAD_PORT = 9;
@@ -37,15 +44,26 @@ function check(step: string, ok: boolean, detail = ''): boolean {
   return ok;
 }
 
+function arg(name: string, fallback: string): string {
+  const idx = process.argv.indexOf(`--${name}`);
+  return idx !== -1 && process.argv[idx + 1] ? process.argv[idx + 1]! : fallback;
+}
+
 /** 待清理的路由位置。 */
-const toClean: Array<{ servePort: number; path: string }> = [
-  { servePort: 443, path: LEAK_PATH },
-  { servePort: 443, path: SAFE_PATH },
-  { servePort: LEAK_PORT, path: LEAK_PATH_ALT },
-  { servePort: 443, path: '/__tsc-blocked' },
+const toClean: Array<{ service: string | null; servePort: number; path: string }> = [
+  { service: null, servePort: 443, path: LEAK_PATH },
+  { service: null, servePort: 443, path: SAFE_PATH },
+  { service: null, servePort: LEAK_PORT, path: LEAK_PATH_ALT },
+  { service: null, servePort: 443, path: '/__tsc-blocked' },
 ];
 
+/** 路由位置的身份键（Service + 端口 + 路径）。 */
+function keyOf(route: { service?: string | null; servePort: number; path: string }): string {
+  return `${route.service ?? 'node'}:${route.servePort}:${route.path}`;
+}
+
 async function main(): Promise<void> {
+  const wantedService = arg('service', '');
   process.stdout.write('\n=== TsController 安全闸门验证 ===\n\n');
 
   const runtime = await createRuntime({
@@ -53,7 +71,8 @@ async function main(): Promise<void> {
   });
   const { gateway, mappings, audit } = runtime;
 
-  const original = (await gateway.snapshot()).routes.map(formatRouteRef).sort();
+  const before = await gateway.snapshot();
+  const original = before.routes.map(formatRouteRef).sort();
 
   try {
     // ---- 准备：泄漏路由先指向无人监听的端口 ----
@@ -69,6 +88,32 @@ async function main(): Promise<void> {
       `httpsPorts=[${prepared.httpsPorts.join(',')}]`,
     );
 
+    // ---- E. Service 命名空间上的暴露（需要真实的 service host 才有意义） ----
+    const serviceInfo =
+      wantedService === ''
+        ? undefined
+        : before.services.find((s) => s.name.toLowerCase() === wantedService.toLowerCase());
+    let serviceLeakPort = 0;
+    if (wantedService !== '' && serviceInfo && serviceInfo.servePorts.length > 0) {
+      serviceLeakPort = serviceInfo.servePorts.includes(443) ? 443 : serviceInfo.servePorts[0]!;
+      // 用**另一条**路径，避免覆盖该 Service 上本该存在的根路由。
+      await gateway.upsertRoute(serviceLeakPort, SERVICE_LEAK_PATH, `http://127.0.0.1:${TEST_ADMIN_PORT}`, wantedService);
+      toClean.push({ service: wantedService, servePort: serviceLeakPort, path: SERVICE_LEAK_PATH });
+      const svcPrepared = await gateway.snapshot();
+      check(
+        `E. 准备一条 ${wantedService} 上的泄漏路由`,
+        svcPrepared.routes.some(
+          (r) => (r.service ?? null) === wantedService && r.path === SERVICE_LEAK_PATH,
+        ),
+        `route=${wantedService}:${serviceLeakPort}${SERVICE_LEAK_PATH}`,
+      );
+    } else if (wantedService !== '') {
+      process.stdout.write(
+        `  [跳过] E 段：本节点上没有可用的 Service ${wantedService}` +
+          `（services=[${before.services.map((s) => s.name).join(',') || '空'}]）。\n`,
+      );
+    }
+
     // ---- A. 启动闸门（443 上的暴露） ----
     const guard = await mappings.enforceExposureGuard();
     check(
@@ -78,14 +123,14 @@ async function main(): Promise<void> {
     );
     check(
       'A. 已自动摘除该路由',
-      guard.removed.some((r) => r.servePort === 443 && r.path === LEAK_PATH),
+      guard.removed.some((r) => r.service === null && r.servePort === 443 && r.path === LEAK_PATH),
       `removed=[${guard.removed.map(formatRouteRef).join(',')}]`,
     );
 
     const after = await gateway.snapshot();
     check(
       'A. serve 中该路由确实消失',
-      !after.routes.some((r) => r.servePort === 443 && r.path === LEAK_PATH),
+      !after.routes.some((r) => r.service === null && r.servePort === 443 && r.path === LEAK_PATH),
     );
 
     // ---- D. 非默认端口上的暴露（本次修复的核心回归点） ----
@@ -105,10 +150,33 @@ async function main(): Promise<void> {
     check(
       `D. 8443 上的既有路由（${preexistingOnLeakPort.length} 条）未被牵连`,
       preexistingOnLeakPort.every((p) =>
-        after.routes.some((r) => r.servePort === p.servePort && r.path === p.path),
+        after.routes.some((r) => keyOf(r) === keyOf(p)),
       ),
       preexistingOnLeakPort.map(formatRouteRef).join(',') || '(该端口上无既有路由)',
     );
+
+    // ---- E 断言 ----
+    if (serviceLeakPort > 0) {
+      check(
+        `E. 检测到 ${wantedService} 上指向管理端口的路由`,
+        guard.exposures.some(
+          (e) => (e.service ?? null) === wantedService && e.path === SERVICE_LEAK_PATH,
+        ),
+        '`serve status --json` 不含 Service，只读它就会漏掉这条 —— 这是本段守住的缺口',
+      );
+      check(
+        `E. 已自动摘除 ${wantedService} 上的该路由`,
+        !after.routes.some(
+          (r) => (r.service ?? null) === wantedService && r.path === SERVICE_LEAK_PATH,
+        ),
+      );
+      check(
+        `E. ${wantedService} 上的既有端点未被牵连`,
+        before.routes
+          .filter((r) => (r.service ?? null) === wantedService)
+          .every((p) => after.routes.some((r) => keyOf(r) === keyOf(p))),
+      );
+    }
 
     // ---- B. 不误伤 ----
     check('B. 指向其它端口的路由被保留', after.routes.some((r) => r.path === SAFE_PATH));
@@ -154,12 +222,10 @@ async function main(): Promise<void> {
     );
   } finally {
     for (const route of toClean) {
-      const exists = (await gateway.snapshot()).routes.some(
-        (r) => r.servePort === route.servePort && r.path === route.path,
-      );
+      const exists = (await gateway.snapshot()).routes.some((r) => keyOf(r) === keyOf(route));
       if (!exists) continue;
       try {
-        await gateway.removeRoute(route.servePort, route.path);
+        await gateway.removeRoute(route.servePort, route.path, route.service);
         process.stdout.write(`  [清理] 摘除 ${formatRouteRef(route)}\n`);
       } catch (err) {
         process.stdout.write(`  [清理失败] ${formatRouteRef(route)}: ${(err as Error).message}\n`);
@@ -173,7 +239,6 @@ async function main(): Promise<void> {
     JSON.stringify(final) === JSON.stringify(original),
     `before=[${original.join(',')}] after=[${final.join(',')}]`,
   );
-
   const failed = results.filter((r) => !r.ok);
   process.stdout.write(`\n=== 结果：${results.length - failed.length}/${results.length} 通过 ===\n`);
   if (failed.length > 0) {

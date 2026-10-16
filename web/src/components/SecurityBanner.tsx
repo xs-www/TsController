@@ -1,6 +1,7 @@
 /** 安全横幅：管理端口是否被 serve 暴露到 tailnet。 */
 import type { JSX } from 'react';
 import type { SystemInfo } from '../api';
+import { formatRouteLabel } from '../utils';
 
 export interface SecurityBannerProps {
   system: SystemInfo | null;
@@ -44,8 +45,8 @@ export function SecurityBanner({ system }: SecurityBannerProps): JSX.Element | n
         </p>
         <ul className="exposure-list">
           {security.exposures.map((e) => (
-            <li key={`${e.servePort}|${e.path}|${e.proxy}`}>
-              <code className="exposure-path">{e.servePort === 443 ? e.path : `:${e.servePort}${e.path}`}</code>
+            <li key={`${e.service ?? '-'}|${e.servePort}|${e.path}|${e.proxy}`}>
+              <code className="exposure-path">{formatRouteLabel(e.servePort, e.path, e.service)}</code>
               <span className="arrow" aria-hidden="true">
                 →
               </span>

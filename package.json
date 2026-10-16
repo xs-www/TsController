@@ -18,6 +18,8 @@
     "build": "npm run web:build",
     "verify:live": "node scripts/verify-live.ts",
     "verify:security": "node scripts/verify-security.ts",
+    "verify:docs": "node scripts/verify-docs.ts",
+    "docs:stats": "node scripts/verify-docs.ts --stats",
     "clean:verify": "node scripts/clean-verify.ts"
   },
   "dependencies": {

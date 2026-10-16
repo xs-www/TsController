@@ -1,22 +1,24 @@
 # TODO
 
-> 当前优先级：**在真实浏览器里验收界面**，其次是「常驻化」与「自动收敛」。
+> 当前优先级：**在真实浏览器里验收界面**，其次是「常驻化」与「自动收敛」，再次是**在一台真实 tagged 设备上验收 Service 级路由**。
 >
-> 状态快照：控制面 + 管理界面均已完成并通过真实环境验证 ——
-> `npm run lint` 0 错（后端 + 前端两套 tsconfig）、`npm test` **112/112 通过**、
+> 状态快照（2026-10-17）：控制面 + 管理界面 + Service 级路由均已完成 ——
+> `npm run lint` 0 错（后端 + 前端两套 tsconfig）、`npm test` **185/185 通过**、
 > `npm run web:build` 产出 `web/dist` 且后端可正确托管、
-> `scripts/verify-live.ts` **9/9 通过**（443 与 8443 两个端口上分别实测，HTTP 200 打穿到容器）、
+> `scripts/verify-live.ts` **9/9 通过**（真实 HTTPS 打穿到容器，HTTP 200 / 674 字节）、
 > `scripts/verify-security.ts` **14/14 通过**（含非默认端口上的暴露拦截）、
-> serve 路由快照已落地并验证容器可只读读取。
+> serve 路由快照已落地（schema **v2**）并验证容器可只读读取。
 >
 > ⚠️ **已知未修缺陷**：同机 Docker 容器可伪造 `Host` 头完整读写管理 API（见第 7 项，实测证据在 `README.md` §5.1）。
 > 因此**不要**把 `/api/*` 用于项目间集成，读路由请用快照文件。
 >
-> 路由模型已定：**路径映射**（`baseURL/xxx`）。「独立主机名 `dsh.xxx.ts.net`」的可行性与代价已实测探明，
-> 记录在 `README.md` §12 与下方第 9 项 —— 不是被忽略，而是当前设备身份下取不到。
+> ⚠️ **Service 级路由尚未在真实 tagged 设备上跑过**：本机 `Self.Tags` 为空、tailnet 里也没有已 tagged 的对端，
+> 因此那条链路的证据只有单测 + 解析层同构输入 + 真实 CLI 对未打 tag 节点的拒绝。补齐方式见第 9 项。
 >
-> **路由身份 = 端口 + 路径**。同一个 `/` 可以同时挂在 443 与 8443 上互不干扰；需要根路径的应用
-> （根绝对路径静态资源）应当给它一个独立端口，而不是挂在路径前缀下（`README.md` §9.2）。
+> **路由身份 = Service + 端口 + 路径**（Service 位为 `null` 即节点级）。同一个 `/` 可以同时挂在 443 与 8443
+> 上互不干扰，也可以同时挂在节点级与某个 Service 上；需要根路径的应用（根绝对路径静态资源）应当给它
+> 一个独立端口，而不是挂在路径前缀下（`README.md` §9.2）。
+> Service 级路由的后端与前端支持均已于 2026-10-17 完成，配置步骤见 `README.md` §12 与下方第 9 项。
 
 ---
 
@@ -117,22 +119,32 @@
 - `tailscale cert dsh.example-tailnet.ts.net` → `invalid domain ...; must be one of ["my-laptop.example-tailnet.ts.net"]`
 - `tailscale serve --service=svc:...` → `service hosts must be tagged nodes`
 
-- [ ] **方案 B（推荐，零身份风险）：用另一台已 tagged 的常开设备当 service host。**
-  - 前提：手上有常开且已打 tag 的设备（`compose.nas.yaml` 提示可能有 NAS）。
-  - 命令：`tailscale serve --service=svc:dsh --https=443 http://my-laptop.example-tailnet.ts.net:3081`
-  - TsController 改动（有限，现有分层可直接复用）：
-    1. `MappingTarget` 增加 `remoteHost?: string`，`buildProxyUrl` 支持 `http://<host>:<port>` 而非固定 `127.0.0.1`；
-    2. `ServeGateway` 增加 service 维度的读写（`--service=svc:<name>`，摘除用 `tailscale serve --service="svc:<name>" --https=443 off`，整组清除用 `tailscale serve clear svc:<name>`）；
-    3. `parseServeStatus` 需要解析新的 `services` 配置段；
-    4. 安全闸门扩展为「任何指向管理端口的 handler，无论节点级还是 service 级，一律摘除」。
-  - 验收：`https://<svc>.<tailnet>.ts.net` 直达容器，且 `tailscale serve status` 中原有 7 条节点级路由不受影响。
+- [x] **方案 B 的代码支持已完成（后端 + 前端，2026-10-17）** —— 原先列的四条改动全部落地，另外补了三处原先没预见到的：
+  1. `MappingTarget.remoteHost?` + `scheme?`；`buildProxyUrl` 改为对象入参；**约束**：远端目标只允许挂在 Service 级路由上（`remote-host-requires-service`）。
+  2. `ServeGateway` / `TailscaleCli` 增加 service 维度读写（`--service=svc:<name>` **必须在 `--https` 之前**）；新增 `serveGetConfig()` 与 `serveClear()`。
+  3. **读 Service 配置不能只改 `parseServeStatus`**：`serve status --json` 里根本没有 Service（上游 [tailscale#18289](https://github.com/tailscale/tailscale/issues/18289)），必须新增 `parseServiceConfig()` 解析 `serve get-config --all`，再由 `mergeServeSnapshots()` 合并——这也是本项最初低估的地方。**只读 `status --json` 会让安全闸门对 Service 路由完全瞎**，与「只解析 443」是同一类缺口。
+  4. 安全闸门覆盖两个命名空间；**只判 loopback 目标**（远端同名端口与本进程无关），见下方已知盲点。
+  5. 新增状态 `awaiting-approval`（配置已写对、只差管理员批准广告；`inSync` 为真，不产生写入）。
+  6. `advertised` 的缺省值不可信：唯一证据是 `status --json` 的 `Self.CapMap["service-host"]`。
+  7. **`get-config` 的读取是有损的**：只有根 handler、**目标路径会丢**。因此 Service 路由的目标路径以映射库为唯一权威，接管时按空路径纳入并在备注里写明。
+- [x] **前端已跟进 Service 级路由**（2026-10-17，仅 `web/**`）：`api.ts` 契约逐字对齐（`MappingStatus` 加 `awaiting-approval`、`RouteRef`/`Exposure`/`ServeRouteView` 加 `service`、`MappingView` 加 `baseUrl`、新增 `ServiceInfo`）；`utils.ts` 加 `normalizeServiceInput` / `serviceShortName` / `isRemoteTarget` / `formatTarget` / `mappingUrl`，`formatRouteLabel` 加可选 `service` 参数；新建 `ServicePanel`（MagicDNS 名 / 端口 / TailVIP 徽标 + 批准指引）；创建表单与编辑行支持 Service + 远端目标主机；未托管路由面板加 Service 列与「Service 配置读出的目标路径不可恢复」说明，接管改为发送 `{service, servePort, path}`；安全横幅与计划摘要带上 Service 与 `awaiting-approval` 计数。
+  - 验证：`npx tsc -p web/tsconfig.json --noEmit` 0 错；`npm run web:build` 成功。
+  - `awaiting-approval` 的界面语义：**不是错误**，是「serve 配置已写对、只差管理员批准广告」，因此用冷色而不是红/黄 —— 后续改动不要把它改回警示色。
+- [ ] **验收（唯一剩下的活）**：在真实 tagged 设备上端到端跑一遍。
+  - 位置：NAS（或任何已打 tag 的常开设备）。
+  - 步骤：① admin console 定义 Service（名字 `dsh`、endpoint `tcp:443`）；② 在 NAS 上 `tailscale serve --service=svc:dsh --https=443 http://<本机 DNS 名>:3081`；③ 批准广告（或配 `autoApprovers.services`）；④ 在 NAS 上跑 TsController 并执行 `node scripts/verify-live.ts --service svc:dsh --remote-host <本机 DNS 名>` 与 `node scripts/verify-security.ts --service svc:dsh`。
+  - 验收：`https://<svc>.<tailnet>.ts.net` 直达容器；`awaiting-approval` 在批准后自动转 `active`；Service 上的暴露被 E 段检测并摘除；原有 7 条节点级路由不受影响。
+  - 已实测的前置拒绝（证明命令拼装与错误翻译确实走到了真 CLI）：在本机（无 tag）执行 Service 写入 → tailscale 报 `service hosts must be tagged nodes`，TsController 译为中文可读提示。
+- [ ] **已知盲点（已登记，未修）**：Service host 反向代理到**本机**的管理端口时，配置里只有远端主机名（`http://my-laptop.<tailnet>.ts.net:8787`），本工具无法判断那台主机就是本机，因此暴露闸门只判 loopback 目标。
+  - 影响面：需要有人在 service host 上主动写下这种目标才会发生；这是「配置者自己把管理面绕出去」，不是本工具的默认行为。
+  - 可选加固：新增一个「本机自识别主机名」集合（tailnet DNS 名 + 100.x + IPv6），把远端目标里命中该集合的也纳入扫描。触发条件：真的出现这种配置，或安全要求提高。
 - [ ] **方案 C（改本机身份）：把本机打成 tagged node。**
   - 代价已在 `README.md` §12.1 列全：Taildrop 失效、不能 SSH 到用户身份的机器、不能被分享、ACL 语义改变、tag 不可全部移除、key expiry 默认关闭，且官方明确劝退笔记本类设备。
   - 另需在 admin console 定义 Service + 管理员审批（或配 `autoApprovers.services`）+ 给客户端配 `grants`；Service 用独立 TailVIP 且目前仅支持 TCP。
   - 结论：**暂不采纳**，除非将来这台机器专职当服务器。
-- [ ] **解析层迁移风险**：`parseServeStatus` 依赖 `serve status --json` 的 legacy raw 格式。Tailscale 1.102 已引入 services 格式（`set-config` 只认新格式），未来若 `status --json` 也切换，解析层需要同步。
+- [ ] **解析层迁移风险**：`parseServeStatus` 依赖 `serve status --json` 的 legacy raw 格式；`parseServiceConfig` 依赖 `get-config --all` 的 `{version, services}` 格式。Tailscale 1.102 已引入 services 格式，未来若这两者再变，解析层需要同步。
   - 位置：`src/tailscale/serve-config.ts`。
-  - 缓解：写入路径用的是稳定的 `--set-path` CLI，即使解析层失效，已生效的路由也不会被误删（删除依赖解析结果，解析失败时 `planReconcile` 只会认为「路径不存在」而跳过删除）。
+  - 缓解：写入路径用的是稳定的 `--set-path` / `--service` CLI，即使解析层失效，已生效的路由也不会被误删（删除依赖解析结果，解析失败时 `planReconcile` 只会认为「位置不存在」而跳过删除）。另外 `get-config` 失败**只降级不致命**（记警告），否则一次读不到 Service 会连带让节点级路由都看不见。
 
 ---
 
@@ -149,7 +161,7 @@
 
 - [x] 在「控制面 / 数据面 / 混合」三方案中选定**控制面**：TsController 不在数据链路上，HTTPS 由 tailscale 提供，本进程挂掉不影响既有路由。
 - [x] 读用 `serve status --json`、写用 `serve --set-path` CLI，**放弃 `set-config`**（实测会静默忽略节点级字段）。
-- [x] 路由键定为**路径前缀**，并实测排除了 `dsh.xxx.ts.net` 独立主机名（见第 9 项与 `README.md` §12）。
+- [x] 路由键定为**路径前缀**（节点级）；独立主机名 `dsh.xxx.ts.net` 当时因设备身份取不到 —— **2026-10-17 已改为支持 Service 级路由**（路由身份升级为 `(service, 端口, 路径)`），见第 9 项与 `README.md` §12。
 
 ### 管理界面（前端）
 
@@ -173,7 +185,7 @@
 - [x] 纯函数差异计算 `planReconcile`，含 `ownedPaths` 记账与「永不删除未托管路由」。
 - [x] `MappingService`：声明式收敛、失败不回滚、串行化队列（并修掉 `setEnabled` 的队列死锁）。
 - [x] Fastify 管理 API 与静态资源托管。
-- [x] 70 个单元/接口测试全绿（多端口改动后增至 **96** 个）。
+- [x] 70 个单元/接口测试全绿（多端口改动后增至 **96** 个，快照改动后 **119**，Service 级路由改动后 **185** 个）。
 
 ### 多端口支持（修复安全缺口）
 
@@ -211,7 +223,7 @@
 
 ### B. 独立主机名路由 `dsh.xxx.ts.net`
 
-见上方第 9 项。**触发条件**：出现一台已 tagged 的常开设备可当 service host（NAS）。届时改动面已在第 9 项列清。
+**已实现（2026-10-17），不再是「决定不做」项**：代码支持（后端 + 前端）已完整落地，只剩真实 tagged 设备上的端到端验收——见上方第 9 项。当时列出的四条改动全部完成，并额外发现了三处原先没预见到的（`status --json` 里没有 Service、`get-config` 读取有损、`advertised` 缺省值不可信），也记在第 9 项。
 
 ### C. 界面内联提示加强前缀剥离说明
 

@@ -12,23 +12,48 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { buildBaseUrl } from './domain/route-path.ts';
-import type { ContainerInfo, Mapping, MappingStatus, ServeSnapshot, TailnetInfo } from './domain/types.ts';
+import type {
+  ContainerInfo,
+  Mapping,
+  MappingStatus,
+  ServeSnapshot,
+  ServiceInfo,
+  TailnetInfo,
+} from './domain/types.ts';
 import type { ReconcilePlan } from './mappings/reconcile.ts';
 
-/** 快照 schema 版本；字段语义变化时递增，消费方据此判断兼容性。 */
-export const SNAPSHOT_SCHEMA_VERSION = 1;
+/**
+ * 快照 schema 版本；字段语义变化时递增，消费方据此判断兼容性。
+ *
+ * - v1：路由身份 = (端口, 路径)
+ * - v2：路由身份 = (Service, 端口, 路径)；新增 `service`/`host`/`services`/`selfTags`
+ */
+export const SNAPSHOT_SCHEMA_VERSION = 2;
 
 /** 快照里的单条路由。 */
 export interface SnapshotRoute {
+  /**
+   * 所属 Tailscale Service（`svc:dsh`）；`null` 表示节点级路由。
+   *
+   * 这是 v2 新增的字段：v1 的 `url` 只能表达节点级地址，Service 路由的对外
+   * 主机名完全不同（`dsh.<tailnet>.ts.net`）。
+   */
+  service: string | null;
+  /** 对外 HTTPS 端口。 */
   servePort: number;
+  /** 挂载路径。 */
   path: string;
+  /** 该路由所属的对外主机名（节点名或 Service 名）。 */
+  host: string | null;
   /** 可直接点击的完整地址；无法确定主机名时为 null。 */
   url: string | null;
   /** serve 中实际的代理地址原文；非代理 handler 为 null。 */
   proxy: string | null;
   /** 代理目标上追加的路径。 */
   targetPath: string;
-  /** 代理目标的本机端口。 */
+  /** 代理目标的主机；本机回环也为 "127.0.0.1"。 */
+  targetHost: string | null;
+  /** 代理目标端口。 */
   targetHostPort: number | null;
   /** 是否已被 TsController 接管。 */
   managed: boolean;
@@ -46,6 +71,13 @@ export interface SnapshotRoute {
   note: string | null;
   /** 映射是否启用；未托管路由为 null。 */
   enabled: boolean | null;
+  /**
+   * Service 端点配置来源（`tailscale serve get-config --all`）。
+   *
+   * 这类路由的 handler 树是**有损**读出的（只有根 handler、目标路径丢失），
+   * 消费方不要据此重建配置。
+   */
+  fromServiceConfig: boolean;
 }
 
 export interface SnapshotSummary {
@@ -57,6 +89,8 @@ export interface SnapshotSummary {
   disabled: number;
   orphanedTarget: number;
   blocked: number;
+  /** 配置写对了但对外还不可用（等待 Service 审批 / 已被 drain）。 */
+  awaitingApproval: number;
 }
 
 export interface Snapshot {
@@ -69,18 +103,24 @@ export interface Snapshot {
     hostname: string | null;
     /** 默认端口的基址，例如 `https://my-laptop.example-tailnet.ts.net`。 */
     baseUrl: string | null;
+    /** MagicDNS 后缀，例如 `example-tailnet.ts.net`；Service 地址靠它拼出。 */
+    magicDnsSuffix: string | null;
+    /** 本节点的 tag（空数组意味着本节点不可能作为 Service host）。 */
+    selfTags: string[];
     tailnetIps: string[];
     /** TsController 管理端口，供消费方识别「这个端口不是业务端口」。 */
     adminPort: number;
   };
-  /** serve 中已声明的全部 HTTPS 端口，升序。 */
+  /** serve 中已声明的全部 HTTPS 端口（节点级 + Service 级），升序。 */
   servePorts: number[];
+  /** 当前节点上的 Tailscale Service 及其状态。 */
+  services: ServiceInfo[];
   routes: SnapshotRoute[];
   summary: SnapshotSummary;
   security: {
     autoUnexpose: boolean;
     /** 指向管理端口的路由；正常情况下应为空。 */
-    exposures: Array<{ servePort: number; path: string; proxy: string }>;
+    exposures: Array<{ service: string | null; servePort: number; path: string; proxy: string }>;
   };
 }
 
@@ -124,28 +164,44 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
 
   const routes: SnapshotRoute[] = serve.routes.map((route) => {
     const owner = route.mappingId ? mappingById.get(route.mappingId) : undefined;
-    // 未托管路由没有映射记录；用 (端口,路径) 反查一次，兼容 serveRoutes() 未标注归属的调用方。
-    const fallbackOwner = owner ?? mappings.find(
-      (m) => m.servePort === route.servePort && m.path.toLowerCase() === route.path.toLowerCase(),
-    );
+    // 未托管路由没有映射记录；用 (Service, 端口, 路径) 反查一次，兼容 serveRoutes() 未标注归属的调用方。
+    const fallbackOwner =
+      owner ??
+      mappings.find(
+        (m) =>
+          (m.service ?? null) === (route.service ?? null) &&
+          m.servePort === route.servePort &&
+          m.path.toLowerCase() === route.path.toLowerCase(),
+      );
     const evaluation = fallbackOwner ? plan.evaluations.get(fallbackOwner.id) : undefined;
-    const origin = buildBaseUrl(tailnet.dnsName, route.servePort);
-    const targetHostPort = route.handler.kind === 'proxy' ? route.handler.hostPort : null;
+    // 对外地址只看**快照主机名**（节点级）或 Service 的 DNS 名（Service 级）。
+    // 刻意不拿 tailnet.dnsName 兜底：那会让「tailscale 未登录、读不到主机名」这种情况
+    // 产出一个看似可用、实际不该点开的链接。
+    const origin = buildBaseUrl(route.host || null, route.servePort, route.service, tailnet.magicDnsSuffix);
+    const handler = route.handler;
+    const isProxy = handler.kind === 'proxy';
+    const targetHostPort = isProxy ? handler.hostPort : null;
+    const targetHost = isProxy ? (handler.host ?? null) : null;
 
     // 容器关联优先取映射库（它带人工确认过的归属）；没有映射时按宿主机端口反查，
     // 这样未托管路由在门户里也能显示「背后是哪个容器」。
+    // 远端目标（service host 代理到另一台机器）不做反查：那是别的机器的容器清单。
+    const isRemote = isProxy && !handler.loopback;
     const fromMapping =
       fallbackOwner?.target.containerName !== undefined
         ? { name: fallbackOwner.target.containerName, port: fallbackOwner.target.containerPort ?? null }
         : null;
-    const guessed = fromMapping ?? findByHostPort(containers, targetHostPort);
+    const guessed = isRemote ? null : (fromMapping ?? findByHostPort(containers, targetHostPort));
 
     return {
+      service: route.service,
       servePort: route.servePort,
       path: route.path,
+      host: route.host || null,
       url: origin === '' ? null : `${origin}${route.path}`,
-      proxy: route.handler.kind === 'proxy' ? route.handler.raw : null,
-      targetPath: route.handler.kind === 'proxy' ? route.handler.targetPath : '',
+      proxy: isProxy ? handler.raw : null,
+      targetPath: isProxy ? handler.targetPath : '',
+      targetHost,
       targetHostPort,
       managed: fallbackOwner !== undefined,
       mappingId: fallbackOwner?.id ?? null,
@@ -155,10 +211,16 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
       containerSource: guessed === null ? null : fromMapping !== null ? 'mapping' : 'port',
       note: fallbackOwner?.note ?? null,
       enabled: fallbackOwner?.enabled ?? null,
+      fromServiceConfig: isProxy && handler.fromServiceConfig === true,
     };
   });
 
-  routes.sort((a, b) => a.servePort - b.servePort || a.path.localeCompare(b.path));
+  routes.sort(
+    (a, b) =>
+      a.servePort - b.servePort ||
+      (a.service ?? '').localeCompare(b.service ?? '') ||
+      a.path.localeCompare(b.path),
+  );
 
   const summary: SnapshotSummary = {
     total: routes.length,
@@ -169,6 +231,7 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
     disabled: 0,
     orphanedTarget: 0,
     blocked: 0,
+    awaitingApproval: 0,
   };
   for (const r of routes) {
     if (r.managed) summary.managed += 1;
@@ -178,6 +241,7 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
     else if (r.status === 'disabled' || r.status === 'disabled-drift') summary.disabled += 1;
     else if (r.status === 'orphaned-target') summary.orphanedTarget += 1;
     else if (r.status === 'blocked' || r.status === 'conflict') summary.blocked += 1;
+    else if (r.status === 'awaiting-approval') summary.awaitingApproval += 1;
   }
 
   return {
@@ -187,15 +251,23 @@ export function buildSnapshot(input: BuildSnapshotInput): Snapshot {
     source: {
       hostname: tailnet.dnsName,
       baseUrl: tailnet.baseUrl,
+      magicDnsSuffix: tailnet.magicDnsSuffix,
+      selfTags: tailnet.tags,
       tailnetIps: tailnet.ips,
       adminPort,
     },
     servePorts: serve.httpsPorts,
+    services: serve.services,
     routes,
     summary,
     security: {
       autoUnexpose,
-      exposures: plan.exposures.map((e) => ({ servePort: e.servePort, path: e.path, proxy: e.proxy })),
+      exposures: plan.exposures.map((e) => ({
+        service: e.service,
+        servePort: e.servePort,
+        path: e.path,
+        proxy: e.proxy,
+      })),
     },
   };
 }

@@ -556,6 +556,33 @@ tbody tr:last-child td {
   color: #9dbdff;
 }
 
+/*
+ * 「等待审批」用冷色调而不是红/黄：配置本身是对的，缺的只是管理后台的一次批准。
+ * 用红色会让用户以为出了故障，从而去做无用的排查。
+ */
+.pill-calm,
+.status-approval {
+  background: rgba(93, 214, 214, 0.14);
+  border-color: #2b6c72;
+  color: #8fe4e4;
+}
+
+.badge-calm {
+  background: rgba(93, 214, 214, 0.14);
+  border-color: #2b6c72;
+  color: #8fe4e4;
+  margin-left: 6px;
+}
+
+.plan-calm {
+  color: #8fe4e4;
+}
+
+.detail-calm {
+  color: #8fe4e4;
+  margin-top: 2px;
+}
+
 .pill-grey,
 .status-disabled {
   background: rgba(139, 151, 172, 0.14);
@@ -697,6 +724,82 @@ tbody tr:last-child td {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+.edit-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 190px;
+}
+
+/* 未托管路由里「目标路径不可恢复」的说明行。 */
+.lossy-row > td {
+  background: rgba(93, 214, 214, 0.06);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+/* ---------------------------- Tailscale Service ---------------------------- */
+
+.service-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.service-card {
+  background: var(--bg-soft);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.service-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.service-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px 20px;
+  margin: 10px 0 0;
+}
+
+.service-grid dt {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-faint);
+}
+
+.service-grid dd {
+  margin: 2px 0 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.service-vip {
+  margin-right: 8px;
+}
+
+.service-help {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: rgba(93, 214, 214, 0.08);
+  border: 1px solid #2b6c72;
+  color: #b6e9e9;
 }
 
 .note-cell {

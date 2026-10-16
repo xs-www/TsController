@@ -20,12 +20,39 @@ const TAILNET: TailnetInfo = {
   hostname: 'My-Laptop',
   backendState: 'Running',
   version: '1.102.4',
+  magicDnsSuffix: 'example-tailnet.ts.net',
+  tags: [],
+  serviceHosts: {},
 };
 
-function route(servePort: number, p: string, proxy: string | null): ServeRoute {
+/**
+ * 组装一份合法的 ServeSnapshot。
+ *
+ * v2 起快照多了 `services`（Service 状态列表），路由也各自带 `service` 维度，
+ * 用这个助手统一补齐，避免每个用例重复写样板。
+ */
+function snapOf(partial: Partial<ServeSnapshot> & Pick<ServeSnapshot, 'routes'>): ServeSnapshot {
   return {
+    httpsPorts: partial.httpsPorts ?? [443],
+    hostname: partial.hostname === undefined ? TAILNET.dnsName : partial.hostname,
+    routes: partial.routes,
+    services: partial.services ?? [],
+  };
+}
+
+function route(
+  servePort: number,
+  p: string,
+  proxy: string | null,
+  service: string | null = null,
+  host: string | null = 'my-laptop.example-tailnet.ts.net',
+): ServeRoute {
+  const targetHost = proxy === null ? null : new URL(proxy).hostname;
+  const loopback = targetHost === '127.0.0.1' || targetHost === 'localhost' || targetHost === '::1';
+  return {
+    service,
     servePort,
-    host: 'my-laptop.example-tailnet.ts.net',
+    host: service ? `${service.replace(/^svc:/, '')}.example-tailnet.ts.net` : (host ?? ''),
     path: p,
     handler:
       proxy === null
@@ -34,8 +61,9 @@ function route(servePort: number, p: string, proxy: string | null): ServeRoute {
             kind: 'proxy',
             raw: proxy,
             hostPort: Number(new URL(proxy).port),
+            host: targetHost,
             targetPath: new URL(proxy).pathname === '/' ? '' : new URL(proxy).pathname,
-            loopback: true,
+            loopback,
           },
     managed: false,
     mappingId: null,
@@ -45,12 +73,14 @@ function route(servePort: number, p: string, proxy: string | null): ServeRoute {
 function mapping(partial: Partial<Mapping> & { path: string; servePort: number; hostPort: number }): Mapping {
   return {
     id: partial.id ?? `m-${partial.servePort}-${partial.path}`,
+    service: partial.service ?? null,
     path: partial.path,
     servePort: partial.servePort,
     target: {
       kind: partial.target?.kind ?? 'host',
       hostPort: partial.hostPort,
       targetPath: partial.target?.targetPath ?? '',
+      ...(partial.target?.remoteHost ? { remoteHost: partial.target.remoteHost } : {}),
       ...(partial.target?.containerName ? { containerName: partial.target.containerName } : {}),
       ...(partial.target?.containerPort !== undefined ? { containerPort: partial.target.containerPort } : {}),
     },
@@ -68,7 +98,7 @@ function build(
   overrides: Partial<BuildSnapshotInput> = {},
   containers: ContainerInfo[] = [],
 ): Snapshot {
-  const plan = planReconcile({ mappings, snapshot: serve, containers, adminPort: 8787 });
+  const plan = planReconcile({ mappings, snapshot: serve, containers, adminPort: 8787, tailnet: TAILNET });
   return buildSnapshot({
     generatedAt: '2026-10-16T00:00:00.000Z',
     generator: 'tscontroller',
@@ -85,7 +115,7 @@ function build(
 
 describe('buildSnapshot', () => {
   it('输出稳定 schema 与来源信息', () => {
-    const snap = build({ httpsPorts: [443], hostname: TAILNET.dnsName, routes: [] }, []);
+    const snap = build(snapOf({ httpsPorts: [443], hostname: TAILNET.dnsName, routes: [] }), []);
     expect(snap.schemaVersion).toBe(SNAPSHOT_SCHEMA_VERSION);
     expect(snap.generatedAt).toBe('2026-10-16T00:00:00.000Z');
     expect(snap.source).toMatchObject({
@@ -99,11 +129,11 @@ describe('buildSnapshot', () => {
   });
 
   it('443 省略端口，非 443 显式带上', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443, 8443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/worldforge', 'http://127.0.0.1:4173'), route(8443, '/', 'http://127.0.0.1:8899')],
-    };
+    });
     const snap = build(serve, []);
 
     expect(snap.routes.map((r) => r.url)).toEqual([
@@ -113,14 +143,23 @@ describe('buildSnapshot', () => {
   });
 
   it('主机名未知时 url 为 null，其余字段仍可用', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: null,
       routes: [route(443, '/x', 'http://127.0.0.1:4173')],
-    };
+    });
+    // 节点级路由的对外地址由**快照主机名**决定（tailnet.dnsName 缺失不影响它）。
     const snap = build(serve, [], { tailnet: { ...TAILNET, dnsName: null, baseUrl: null } });
-    expect(snap.routes[0]!.url).toBeNull();
-    expect(snap.routes[0]!.proxy).toBe('http://127.0.0.1:4173');
+    expect(snap.source.hostname).toBeNull();
+    expect(snap.routes[0]!.url).toBe('https://my-laptop.example-tailnet.ts.net/x');
+
+    // 快照本身也没有主机名（例如 tailscale 未登录）时才是 null。
+    const blind = build(
+      snapOf({ httpsPorts: [443], hostname: null, routes: [route(443, '/x', 'http://127.0.0.1:4173', null, null)] }),
+      [],
+    );
+    expect(blind.routes[0]!.url).toBeNull();
+    expect(blind.routes[0]!.proxy).toBe('http://127.0.0.1:4173');
   });
 
   it('区分受管与未托管，并带上映射元数据', () => {
@@ -136,13 +175,13 @@ describe('buildSnapshot', () => {
         containerName: 'worldforge',
         containerPort: 8080,
       },
-      ownedRoutes: [{ servePort: 443, path: '/worldforge' }],
+      ownedRoutes: [{ service: null, servePort: 443, path: '/worldforge' }],
     });
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/', 'http://127.0.0.1:3081'), route(443, '/worldforge', 'http://127.0.0.1:4173')],
-    };
+    });
     const snap = build(
       serve,
       [m],
@@ -166,7 +205,7 @@ describe('buildSnapshot', () => {
   });
 
   it('汇总计数覆盖各状态', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [
@@ -175,11 +214,11 @@ describe('buildSnapshot', () => {
         route(443, '/c', 'http://127.0.0.1:1002'),
         route(443, '/free', 'http://127.0.0.1:9999'),
       ],
-    };
+    });
     const mappings = [
-      mapping({ path: '/a', servePort: 443, hostPort: 1000, ownedRoutes: [{ servePort: 443, path: '/a' }] }),
+      mapping({ path: '/a', servePort: 443, hostPort: 1000, ownedRoutes: [{ service: null, servePort: 443, path: '/a' }] }),
       mapping({ path: '/b', servePort: 443, hostPort: 2000 }), // 未写入 → pending
-      mapping({ path: '/c', servePort: 443, hostPort: 1002, enabled: false, ownedRoutes: [{ servePort: 443, path: '/c' }] }),
+      mapping({ path: '/c', servePort: 443, hostPort: 1002, enabled: false, ownedRoutes: [{ service: null, servePort: 443, path: '/c' }] }),
     ];
     const snap = build(serve, mappings);
 
@@ -192,6 +231,7 @@ describe('buildSnapshot', () => {
       disabled: 1,
       orphanedTarget: 0,
       blocked: 0,
+      awaitingApproval: 0,
     });
   });
 
@@ -200,13 +240,13 @@ describe('buildSnapshot', () => {
       path: '/',
       servePort: 8443,
       hostPort: 8899,
-      ownedRoutes: [{ servePort: 8443, path: '/' }],
+      ownedRoutes: [{ service: null, servePort: 8443, path: '/' }],
     });
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443, 8443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/', 'http://127.0.0.1:3081'), route(8443, '/', 'http://127.0.0.1:8899')],
-    };
+    });
     const snap = build(serve, [m]);
 
     const on443 = snap.routes.find((r) => r.servePort === 443)!;
@@ -216,28 +256,28 @@ describe('buildSnapshot', () => {
   });
 
   it('非代理 handler 的代理字段为空但路由仍被列出', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/text', null)],
-    };
+    });
     const snap = build(serve, []);
     expect(snap.routes[0]).toMatchObject({ proxy: null, targetHostPort: null, targetPath: '' });
   });
 
   it('暴露会被写进 security 段', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443, 8443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/leak', 'http://127.0.0.1:8787'), route(8443, '/leak2', 'http://127.0.0.1:8787')],
-    };
+    });
     const snap = build(serve, [], { autoUnexpose: false });
     expect(snap.security.autoUnexpose).toBe(false);
     expect(snap.security.exposures.map((e) => `${e.servePort}:${e.path}`)).toEqual(['443:/leak', '8443:/leak2']);
   });
 
   it('路由按端口再按路径排序', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443, 8443],
       hostname: TAILNET.dnsName,
       routes: [
@@ -245,17 +285,17 @@ describe('buildSnapshot', () => {
         route(443, '/b', 'http://127.0.0.1:2'),
         route(443, '/a', 'http://127.0.0.1:3'),
       ],
-    };
+    });
     const snap = build(serve, []);
     expect(snap.routes.map((r) => `${r.servePort}${r.path}`)).toEqual(['443/a', '443/b', '8443/z']);
   });
 
   it('未托管路由也能按宿主机端口反查容器（门户需要这个）', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/portal', 'http://127.0.0.1:8899'), route(443, '/ghost', 'http://127.0.0.1:65000')],
-    };
+    });
     const snap = build(
       serve,
       [],
@@ -290,13 +330,13 @@ describe('buildSnapshot', () => {
         containerName: 'mapped-name',
         containerPort: 4000,
       },
-      ownedRoutes: [{ servePort: 443, path: '/portal' }],
+      ownedRoutes: [{ service: null, servePort: 443, path: '/portal' }],
     });
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/portal', 'http://127.0.0.1:8899')],
-    };
+    });
     // 容器清单里同一个端口对应另一个名字——映射库应当胜出。
     const snap = build(serve, [m], {}, [makeContainer('port-name', [{ hostPort: 8899, containerPort: 3000 }])]);
 
@@ -309,11 +349,11 @@ describe('buildSnapshot', () => {
   });
 
   it('已停止的容器不参与端口反查（优先运行中的）', () => {
-    const serve: ServeSnapshot = {
+    const serve: ServeSnapshot = snapOf({
       httpsPorts: [443],
       hostname: TAILNET.dnsName,
       routes: [route(443, '/x', 'http://127.0.0.1:5000')],
-    };
+    });
     const snap = build(
       serve,
       [],
@@ -328,7 +368,7 @@ describe('buildSnapshot', () => {
 
   it('可被 JSON 序列化（消费方直接 JSON.parse）', () => {
     const snap = build(
-      { httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] },
+      snapOf({ httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] }),
       [],
     );
     expect(JSON.parse(JSON.stringify(snap))).toEqual(snap);
@@ -349,7 +389,7 @@ describe('FileSnapshotWriter', () => {
     const writer = new FileSnapshotWriter(target);
 
     const snap = build(
-      { httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] },
+      snapOf({ httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] }),
       [],
     );
     const written = await writer.write(snap);
@@ -363,9 +403,9 @@ describe('FileSnapshotWriter', () => {
   it('重复写入覆盖而不是追加，且不残留临时文件', async () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), 'tsc-snap-'));
     const writer = new FileSnapshotWriter(path.join(dir, 'public'));
-    const empty = build({ httpsPorts: [], hostname: null, routes: [] }, []);
+    const empty = build(snapOf({ httpsPorts: [], hostname: null, routes: [] }), []);
     const one = build(
-      { httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] },
+      snapOf({ httpsPorts: [443], hostname: TAILNET.dnsName, routes: [route(443, '/x', 'http://127.0.0.1:1')] }),
       [],
     );
 

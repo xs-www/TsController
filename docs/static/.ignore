@@ -1,0 +1,45 @@
+# 静态文档生成的排除规则（权威清单的输入）
+#
+# 用途：Phase 1 目录枚举时据此过滤。被排除的条目必须在 docs/static/README.md 里登记原因。
+
+## 版本控制（不是项目内容）
+.git/
+
+## 第三方依赖
+node_modules/
+
+## 构建产物（由源码重建，不单独归档）
+web/dist/
+dist/
+build/
+
+## 运行时数据（含真实映射库与审计日志，可能含个人环境信息）
+data/
+
+## 锁文件（体积大、无函数语义，由 package.json 重建）
+package-lock.json
+
+## 二进制 / 图片
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.ico
+*.svg
+*.zip
+*.tar.gz
+*.exe
+*.dll
+*.so
+
+## 缓存与临时文件
+*.tmp
+*.log
+__pycache__/
+.cache/
+
+## 本就是给人读的文档（不重复归档；docs/static/** 是本文档树自身）
+README.md
+todo.md
+docs/*.md
+docs/static/**

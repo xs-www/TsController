@@ -4,31 +4,64 @@
  * 有了它们，映射服务与 HTTP API 的全部行为都能在无 Docker、无 Tailscale 的
  * 沙箱里被完整覆盖。
  *
- * 路由身份是「端口 + 路径」，因此内部用 `serveRouteKey()` 作键。为保持可读性，
- * 构造函数的键支持两种写法：`"/app"`（默认 443）与 `":8443/app"`（指定端口）。
+ * 路由身份是三元组 `(service, servePort, path)`，因此内部用 `serveRouteKey()`
+ * 作键。为保持可读性，构造函数的键支持三种写法：
+ * - `"/app"`              默认 Service 为节点级、端口 443；
+ * - `":8443/app"`         指定端口；
+ * - `"svc:dsh:443/"`      指定 Service 与端口（Service 名前缀写全 `svc:`）。
  */
 
 import { serveRouteKey } from '../src/domain/route-path.ts';
-import type { ContainerInfo, ServeRoute, ServeSnapshot, TailnetInfo } from '../src/domain/types.ts';
+import type {
+  ContainerInfo,
+  ServeRoute,
+  ServeSnapshot,
+  ServiceInfo,
+  TailnetInfo,
+} from '../src/domain/types.ts';
 import type { ContainerSource } from '../src/docker/docker-service.ts';
 import type { ServeGateway } from '../src/tailscale/tailscale-service.ts';
 
 /** 测试里默认的对外端口；绝大多数用例只关心它。 */
 export const TEST_SERVE_PORT = 443;
 
-/** 解析测试用的简写键：`"/app"` → (443, "/app")；`":8443/app"` → (8443, "/app")。 */
-export function parseFakeRouteKey(key: string): { servePort: number; path: string } {
-  const m = /^:(\d+)(\/.*)$/.exec(key);
-  if (m) return { servePort: Number(m[1]), path: m[2]! };
-  return { servePort: TEST_SERVE_PORT, path: key };
+/** 测试里的默认 Service 名（用于 Service 相关用例）。 */
+export const TEST_SERVICE = 'svc:dsh';
+
+/**
+ * 解析测试用的简写键。
+ *
+ * 三种写法：
+ * - `"/app"`            → `{service: null, servePort: 443, path: '/app'}`
+ * - `":8443/app"`       → `{service: null, servePort: 8443, path: '/app'}`
+ * - `"svc:dsh:443/"`    → `{service: 'svc:dsh', servePort: 443, path: '/'}`
+ *
+ * 注意 `"svc:dsh:/"` 也是合法的（省略端口，用默认 443）。
+ */
+export function parseFakeRouteKey(key: string): { service: string | null; servePort: number; path: string } {
+  let rest = key;
+  let service: string | null = null;
+
+  // Service 前缀是 `svc:<名字>:`，因此要匹配到**第二个**冒号为止。
+  const svc = /^(svc:[a-z0-9._-]+):(.*)$/.exec(rest);
+  if (svc) {
+    service = svc[1]!;
+    rest = svc[2]!;
+  }
+
+  const m = /^:(\d+)(\/.*)$/.exec(rest);
+  if (m) return { service, servePort: Number(m[1]), path: m[2]! };
+  return { service, servePort: TEST_SERVE_PORT, path: rest };
 }
 
 /** 内存 serve 网关：`handlers` 就是“真实”的 serve 配置。 */
 export class FakeServeGateway implements ServeGateway {
-  /** 键为 `serveRouteKey(port, path)`。 */
+  /** 键为 `serveRouteKey(service, servePort, path)`。 */
   readonly handlers = new Map<string, string>();
   /** serve 中已声明的 HTTPS 端口。 */
   readonly httpsPorts = new Set<number>([TEST_SERVE_PORT]);
+  /** Service 状态；默认空，用例可自行注入。 */
+  services: ServiceInfo[] = [];
 
   tailnetInfo: TailnetInfo = {
     dnsName: 'my-laptop.example-tailnet.ts.net',
@@ -37,17 +70,28 @@ export class FakeServeGateway implements ServeGateway {
     hostname: 'My-Laptop',
     backendState: 'Running',
     version: '1.102.4',
+    magicDnsSuffix: 'example-tailnet.ts.net',
+    tags: [],
+    serviceHosts: {},
   };
   /** 让指定路由的写入失败，用于验证失败可重试。键同 `handlers`。 */
   readonly failUpsert = new Set<string>();
   readonly failRemove = new Set<string>();
   /** 记录调用轨迹。 */
-  readonly calls: Array<{ op: 'upsert' | 'remove'; servePort: number; path: string; proxy?: string }> = [];
+  readonly calls: Array<{
+    op: 'upsert' | 'remove';
+    service: string | null;
+    servePort: number;
+    path: string;
+    proxy?: string;
+  }> = [];
+  /** `clearService` 的调用轨迹（真实网关才有的可选能力）。 */
+  readonly clearedServices: string[] = [];
 
   constructor(initial: Record<string, string> = {}, extraPorts: number[] = []) {
     for (const [k, v] of Object.entries(initial)) {
-      const { servePort, path } = parseFakeRouteKey(k);
-      this.handlers.set(serveRouteKey(servePort, path), v);
+      const { service, servePort, path } = parseFakeRouteKey(k);
+      this.handlers.set(serveRouteKey(service, servePort, path), v);
       this.httpsPorts.add(servePort);
     }
     for (const p of extraPorts) this.httpsPorts.add(p);
@@ -56,36 +100,50 @@ export class FakeServeGateway implements ServeGateway {
   /* ------------------------- 便于断言的读写助手 ------------------------- */
 
   /** 取某条路由的代理地址；不存在返回 undefined。 */
-  proxyOf(path: string, servePort: number = TEST_SERVE_PORT): string | undefined {
-    return this.handlers.get(serveRouteKey(servePort, path));
+  proxyOf(path: string, servePort: number = TEST_SERVE_PORT, service: string | null = null): string | undefined {
+    return this.handlers.get(serveRouteKey(service, servePort, path));
   }
 
   /** 某条路由是否存在。 */
-  has(path: string, servePort: number = TEST_SERVE_PORT): boolean {
-    return this.handlers.has(serveRouteKey(servePort, path));
+  has(path: string, servePort: number = TEST_SERVE_PORT, service: string | null = null): boolean {
+    return this.handlers.has(serveRouteKey(service, servePort, path));
   }
 
   /** 直接设置一条路由（绕过调用轨迹，用于准备前置状态）。 */
-  set(path: string, proxy: string, servePort: number = TEST_SERVE_PORT): void {
-    this.handlers.set(serveRouteKey(servePort, path), proxy);
+  set(path: string, proxy: string, servePort: number = TEST_SERVE_PORT, service: string | null = null): void {
+    this.handlers.set(serveRouteKey(service, servePort, path), proxy);
     this.httpsPorts.add(servePort);
   }
 
+  /** 声明一个 Service（默认已承认）。 */
+  addService(name: string, ports: number[], advertised = true, vipIps: string[] = []): ServiceInfo {
+    const info: ServiceInfo = {
+      name,
+      dnsName: `${name.replace(/^svc:/, '')}.example-tailnet.ts.net`,
+      servePorts: [...ports].sort((a, b) => a - b),
+      advertised,
+      vipIps,
+    };
+    this.services = [...this.services.filter((s) => s.name !== name), info];
+    for (const p of ports) this.httpsPorts.add(p);
+    return info;
+  }
+
   /** 让某条路由的挂载失败。 */
-  fail(path: string, servePort: number = TEST_SERVE_PORT): void {
-    this.failUpsert.add(serveRouteKey(servePort, path));
+  fail(path: string, servePort: number = TEST_SERVE_PORT, service: string | null = null): void {
+    this.failUpsert.add(serveRouteKey(service, servePort, path));
   }
 
   /** 让某条路由的摘除失败。 */
-  failDeletion(path: string, servePort: number = TEST_SERVE_PORT): void {
-    this.failRemove.add(serveRouteKey(servePort, path));
+  failDeletion(path: string, servePort: number = TEST_SERVE_PORT, service: string | null = null): void {
+    this.failRemove.add(serveRouteKey(service, servePort, path));
   }
 
   /** 全部路由位置，便于断言。 */
-  routes(): Array<{ servePort: number; path: string; proxy: string }> {
+  routes(): Array<{ service: string | null; servePort: number; path: string; proxy: string }> {
     return [...this.handlers.entries()].map(([k, proxy]) => {
-      const { servePort, path } = unkey(k);
-      return { servePort, path, proxy };
+      const { service, servePort, path } = unkey(k);
+      return { service, servePort, path, proxy };
     });
   }
 
@@ -97,51 +155,84 @@ export class FakeServeGateway implements ServeGateway {
 
   async snapshot(): Promise<ServeSnapshot> {
     const routes: ServeRoute[] = this.routes()
-      .map(({ servePort, path, proxy }) => {
-        const url = new URL(proxy);
+      .map(({ service, servePort, path, proxy }) => {
+        const parsed = new URL(proxy);
+        const host = parsed.hostname;
+        const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
         return {
+          service,
           servePort,
-          host: 'my-laptop.example-tailnet.ts.net',
+          host: service
+            ? `${service.replace(/^svc:/, '')}.example-tailnet.ts.net`
+            : 'my-laptop.example-tailnet.ts.net',
           path,
           handler: {
             kind: 'proxy' as const,
             raw: proxy,
-            hostPort: Number(url.port),
-            targetPath: url.pathname === '/' ? '' : url.pathname,
-            loopback: true,
+            hostPort: Number(parsed.port),
+            host,
+            targetPath: parsed.pathname === '/' ? '' : parsed.pathname,
+            loopback,
+            // 与真实网关一致：Service 配置读回来的端点带这个标记。
+            ...(service ? { fromServiceConfig: true } : {}),
           },
           managed: false,
           mappingId: null,
         };
       })
-      .sort((a, b) => a.servePort - b.servePort || a.path.localeCompare(b.path));
-    return { httpsPorts: [...this.httpsPorts].sort((a, b) => a - b), hostname: 'my-laptop.example-tailnet.ts.net', routes };
+      .sort(
+        (a, b) =>
+          a.servePort - b.servePort ||
+          (a.service ?? '').localeCompare(b.service ?? '') ||
+          a.path.localeCompare(b.path),
+      );
+    return {
+      httpsPorts: [...this.httpsPorts].sort((a, b) => a - b),
+      hostname: 'my-laptop.example-tailnet.ts.net',
+      routes,
+      services: structuredClone(this.services),
+    };
   }
 
   async tailnet(): Promise<TailnetInfo> {
-    return this.tailnetInfo;
+    return structuredClone(this.tailnetInfo);
   }
 
-  async upsertRoute(servePort: number, path: string, proxyUrl: string): Promise<void> {
-    this.calls.push({ op: 'upsert', servePort, path, proxy: proxyUrl });
-    const key = serveRouteKey(servePort, path);
+  async upsertRoute(
+    servePort: number,
+    path: string,
+    proxyUrl: string,
+    service: string | null = null,
+  ): Promise<void> {
+    this.calls.push({ op: 'upsert', service, servePort, path, proxy: proxyUrl });
+    const key = serveRouteKey(service, servePort, path);
     if (this.failUpsert.has(key)) throw new Error(`模拟失败：无法挂载 ${servePort}:${path}`);
     this.handlers.set(key, proxyUrl);
     this.httpsPorts.add(servePort);
   }
 
-  async removeRoute(servePort: number, path: string): Promise<void> {
-    this.calls.push({ op: 'remove', servePort, path });
-    const key = serveRouteKey(servePort, path);
+  async removeRoute(servePort: number, path: string, service: string | null = null): Promise<void> {
+    this.calls.push({ op: 'remove', service, servePort, path });
+    const key = serveRouteKey(service, servePort, path);
     if (this.failRemove.has(key)) throw new Error(`模拟失败：无法摘除 ${servePort}:${path}`);
     this.handlers.delete(key);
   }
+
+  async clearService(service: string): Promise<void> {
+    this.clearedServices.push(service);
+    for (const [k] of [...this.handlers.entries()]) {
+      const route = unkey(k);
+      if ((route.service ?? '') === service) this.handlers.delete(k);
+    }
+    this.services = this.services.filter((s) => s.name !== service);
+  }
 }
 
-/** 把内部键拆回端口与路径。 */
-function unkey(key: string): { servePort: number; path: string } {
-  const idx = key.indexOf('|');
-  return { servePort: Number(key.slice(0, idx)), path: key.slice(idx + 1) };
+/** 把内部键拆回 Service、端口与路径。 */
+function unkey(key: string): { service: string | null; servePort: number; path: string } {
+  const parts = key.split('|');
+  const service = parts[0] === '-' ? null : parts[0]!;
+  return { service, servePort: Number(parts[1]), path: parts[2]! };
 }
 
 /** 内存容器清单。 */

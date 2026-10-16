@@ -1,0 +1,77 @@
+# 静态文档权威清单（manifest）
+#
+# 由 Phase 1 一次性完整枚举生成，是全流程唯一的遍历依据。
+# 状态：pending（待生成）/ done（已生成镜像文档）/ skipped（明确跳过，原因见 docs/static/README.md）
+# 格式：`状态<TAB>类别<TAB>相对路径`
+#
+# 类别：code = 函数级文档；config = 结构概述级文档；doc = 索引条目级；skip = 不分析内容
+#
+# 生成时间：2026-10-17
+# 对应源码版本：见 docs/static/README.md（commit hash）
+
+done	code	src/domain/types.ts
+done	code	src/domain/route-path.ts
+done	code	src/docker/docker-client.ts
+done	code	src/docker/docker-service.ts
+done	code	src/tailscale/serve-config.ts
+done	code	src/tailscale/tailscale-cli.ts
+done	code	src/tailscale/tailscale-service.ts
+done	code	src/mappings/store.ts
+done	code	src/mappings/reconcile.ts
+done	code	src/mappings/mapping-service.ts
+done	code	src/config.ts
+done	code	src/logger.ts
+done	code	src/snapshot.ts
+done	code	src/app.ts
+done	code	src/runtime.ts
+done	code	src/main.ts
+done	code	web/src/api.ts
+done	code	web/src/utils.ts
+done	code	web/src/App.tsx
+done	code	web/src/main.tsx
+done	code	web/src/components/shared.ts
+done	code	web/src/components/Toast.tsx
+done	code	web/src/components/CopyButton.tsx
+done	code	web/src/components/TopBar.tsx
+done	code	web/src/components/Toolbar.tsx
+done	code	web/src/components/SecurityBanner.tsx
+done	code	web/src/components/ServicePanel.tsx
+done	code	web/src/components/ContainerPanel.tsx
+done	code	web/src/components/MappingPanel.tsx
+done	code	web/src/components/ExternalRoutesPanel.tsx
+done	code	scripts/clean-verify.ts
+done	code	scripts/verify-live.ts
+done	code	scripts/verify-security.ts
+done	code	scripts/verify-docs.ts
+done	code	test/fakes.ts
+done	code	test/route-path.test.ts
+done	code	test/serve-config.test.ts
+done	code	test/service-config.test.ts
+done	code	test/reconcile.test.ts
+done	code	test/service-routing.test.ts
+done	code	test/mapping-service.test.ts
+done	code	test/api.test.ts
+done	code	test/snapshot.test.ts
+done	code	test/config-and-docker.test.ts
+done	config	package.json
+done	config	tsconfig.json
+done	config	vitest.config.ts
+done	config	web/index.html
+done	config	web/tsconfig.json
+done	config	web/vite.config.ts
+done	config	web/src/styles.css
+done	config	deploy/Dockerfile
+done	config	deploy/docker-compose.yml
+done	config	.dockerignore
+done	config	.gitattributes
+done	config	.github/workflows/docker-publish.yml
+done	config	.gitignore
+skip	doc	README.md
+skip	doc	todo.md
+skip	doc	docs/image-publishing.md
+skip	doc	docs/nas-deployment.md
+skip	doc	docs/static/**
+skip	skip	package-lock.json
+skip	skip	data/**
+skip	skip	web/dist/**
+skip	skip	node_modules/**

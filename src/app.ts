@@ -39,6 +39,16 @@ const mappingBodySchema = z.object({
   /** 对外 HTTPS 端口；省略时后端用配置里的默认端口。 */
   servePort: z.number().int().min(1).max(65535).optional(),
   targetPath: z.string().optional(),
+  /**
+   * 关联的 Tailscale Service，接受 `dsh` 或 `svc:dsh`。
+   *
+   * `null` / 空串表示节点级路由。字段省略表示「不改动」（PATCH 语义）。
+   */
+  service: z.string().max(120).nullable().optional(),
+  /** 代理目标主机；省略即本机。只在 Service 级路由上支持。 */
+  remoteHost: z.string().max(253).nullable().optional(),
+  /** 代理协议；省略即 http。 */
+  scheme: z.enum(['http', 'https']).optional(),
   kind: z.enum(['container', 'host']).optional(),
   containerId: z.string().optional(),
   containerName: z.string().optional(),
@@ -102,25 +112,38 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       deps.gateway.snapshot(),
       deps.mappings.overview(),
     ]);
+    // 暴露判定只对**本机回环**目标成立：远端主机上的同名端口与本进程无关。
     const exposures = snapshot.routes
-      .filter((r) => r.handler.kind === 'proxy' && r.handler.hostPort === config.port)
-      .map((r) => ({ servePort: r.servePort, path: r.path, proxy: r.handler.kind === 'proxy' ? r.handler.raw : '' }));
+      .filter((r) => r.handler.kind === 'proxy' && r.handler.loopback && r.handler.hostPort === config.port)
+      .map((r) => ({
+        service: r.service,
+        servePort: r.servePort,
+        path: r.path,
+        proxy: r.handler.kind === 'proxy' ? r.handler.raw : '',
+      }));
 
     return {
       baseUrl: tailnet.baseUrl,
       dnsName: tailnet.dnsName,
+      magicDnsSuffix: tailnet.magicDnsSuffix,
       tailnetIps: tailnet.ips,
       hostname: tailnet.hostname,
       backendState: tailnet.backendState,
       tailscaleVersion: tailnet.version,
+      /** 本节点的 tag；为空即本节点不可能充当 Service host。 */
+      selfTags: tailnet.tags,
+      /** 本节点是否具备充当 Service host 的身份前提。 */
+      canHostService: tailnet.tags.length > 0,
       adminUrl: `http://${config.host}:${config.port}`,
       adminPort: config.port,
       /** 新建映射时的默认对外端口。 */
       servePort: config.servePort,
       /** serve 中已声明的全部 HTTPS 端口（可能包含本工具未托管的路由）。 */
       servePorts: snapshot.httpsPorts,
-      /** serve 主机名（不含端口）。 */
+      /** 节点级 serve 主机名（不含端口）。 */
       serveHost: snapshot.hostname,
+      /** 当前节点上的 Tailscale Service 及状态。 */
+      services: overview.services,
       sources: {
         docker: deps.containers.describeSource(),
         tailscale: deps.gateway.describeSource(),
@@ -164,6 +187,9 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       targetPath: input.targetPath ?? current.target.targetPath,
       note: input.note ?? current.note,
       enabled: input.enabled ?? current.enabled,
+      ...(input.service !== undefined ? { service: input.service } : {}),
+      ...(input.remoteHost !== undefined ? { remoteHost: input.remoteHost } : {}),
+      ...(input.scheme !== undefined ? { scheme: input.scheme } : {}),
       ...(input.confirmTakeover !== undefined ? { confirmTakeover: input.confirmTakeover } : {}),
     });
   });
@@ -182,8 +208,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post('/api/mappings/import', async (req) => {
     const body = z
       .object({
-        /** 要接管的未托管路由；省略即接管全部。路由身份是「端口 + 路径」。 */
-        routes: z.array(z.object({ servePort: z.number().int().min(1).max(65535), path: z.string().min(1) })).optional(),
+        /** 要接管的未托管路由；省略即接管全部。路由身份是 (Service, 端口, 路径)。 */
+        routes: z
+          .array(
+            z.object({
+              service: z.string().max(120).nullable().optional(),
+              servePort: z.number().int().min(1).max(65535),
+              path: z.string().min(1),
+            }),
+          )
+          .optional(),
       })
       .parse(req.body ?? {});
     return deps.mappings.importExternal(body.routes);
@@ -193,7 +227,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   app.get('/api/serve/routes', async () => {
     const [routes, snapshot] = await Promise.all([deps.mappings.serveRoutes(), deps.gateway.snapshot()]);
-    return { serveHost: snapshot.hostname, httpsPorts: snapshot.httpsPorts, routes };
+    return {
+      serveHost: snapshot.hostname,
+      httpsPorts: snapshot.httpsPorts,
+      services: snapshot.services,
+      routes,
+    };
   });
 
   app.get('/api/audit', async (req) => {

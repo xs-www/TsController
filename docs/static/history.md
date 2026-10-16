@@ -1,382 +1,10 @@
-# 静态函数文档
+# 变更归档（历史取舍与实测证据）
 
-## 文档信息
-
-| 项目 | 内容 |
-| --- | --- |
-| 版本 | 0.1.0（首个可用版本） |
-| 更新日期 | 2026-10-15 |
-| 范围 | Docker 容器端口发现 → 映射库 → 与 `tailscale serve` 配置的声明式收敛 → 本机管理 API |
-| 运行时 | Node.js 22.18+（原生 TS 类型擦除，无编译步骤）+ Fastify 5 + React 19 / Vite 6 |
-| 外部依赖 | Tailscale CLI（唯一写入口）、Docker Engine API（经本地端点） |
-| 持久化 | `<DATA_DIR>/mappings.json`（映射库）、`<DATA_DIR>/audit.jsonl`（审计日志） |
-| 测试 | 70 个单元/接口测试（全部注入假实现，不需要 Docker 与 Tailscale） |
-
-> 本文件是本项目**首次提交的全量归档**。归档范围 = `git status` 中全部新增文件。
-> 后续每次改动都应在文末追加一节「变更归档」，写明修改的函数与原因。
+> 本文件保留每次改动的**原因、取舍与实测数据**。当前代码的静态结构见 docs/static/README.md 索引的镜像文档。
+> 归档原则：只增不改 —— 后来的改动如果推翻了早先的结论，在新条目里写明，并在旧条目标注「已被 xxx 取代」。
 
 ---
 
-## 0. 架构约束（读代码前必读）
-
-三条约束解释了本代码库的全部结构：
-
-1. **控制面，不是数据面。** 本进程从不转发用户流量。它只读写 `tailscaled` 的 serve 配置。因此数据链路里只有一个网关接口 `ServeGateway`，且它的写操作只有「挂载」和「摘除」两种。
-2. **声明式收敛。** 映射库 = 期望状态，serve 配置 = 实际状态。二者的差异由纯函数 `planReconcile()` 计算，副作用集中在 `MappingService.applyInternal()`。所有状态判定逻辑因此可在单测中穷举。
-3. **只删自己写过的路径。** 每条映射用 `ownedPaths` 记账它在 serve 中占用过的路径。`planReconcile()` 只摘除「曾被某条映射占用、且当前不在期望集合中」的路径，用户手工配置的路由永不误删。
-
----
-
-## 1. `src/domain/types.ts` —— 跨层类型
-
-无运行时依赖，只描述形状，便于测试构造替身。
-
-| 类型 | 用途 | 关键字段 |
-| --- | --- | --- |
-| `ContainerPort` | 容器发布端口 | `hostIp` / `hostPort` / `containerPort` / `protocol` |
-| `ContainerInfo` | 归一化容器 | `name`、`state`、`composeProject`、`ports` |
-| `MappingTarget` | 映射目标 | `kind: 'container' \| 'host'`、`hostPort`、`targetPath`、`containerName`、`containerPort` |
-| `Mapping` | 持久化记录 | `path`、`target`、`enabled`、`ownedPaths` |
-| `MappingStatus` | 健康度 | 见下表 |
-| `MappingView` | 运行时视图 | `Mapping` + `status` + `desiredProxy` + `actualProxy` + `detail` |
-| `ServeHandler` | serve handler 解析结果 | `kind: 'proxy' \| 'file' \| 'text' \| 'other'` |
-| `ServeSnapshot` | serve 配置快照 | `webHost`、`httpsPort`、`routes` |
-| `TailnetInfo` | 本机 tailnet 身份 | `dnsName`、`baseUrl`、`ips`、`backendState` |
-| `AuditEvent` | 审计事件 | `kind`、`message`、`detail` |
-
-`MappingStatus` 取值与判定优先级（从高到低）：
-
-```text
-blocked           目标端口 == 管理端口
-conflict          同一路径被多条映射占用（防御性）
-disabled-drift / disabled
-orphaned-target   容器型映射的目标不存在 / 未运行 / 不再发布该端口
-pending           路径缺失、或指向与期望不符
-active            完全一致
-```
-
-**`ownedPaths` 存在的唯一理由**：路径改名。改名后旧路径不再出现在任何 `mapping.path` 中，若不记账就会变成无人认领的孤儿 handler，继续把流量送进容器。
-
----
-
-## 2. `src/domain/route-path.ts` —— 路径与代理地址纯函数
-
-所有路径的第一道也是唯一一道关卡：API 入参、磁盘数据、从 serve 读回的值都必须先经过这里。
-
-### `normalizeRoutePath(input): PathValidation`
-
-- 必须以 `/` 开头；禁止空白、`?`、`#`、反斜杠、控制字符；禁止 `.` 与 `..` 段。
-- 折叠重复斜杠、去掉尾斜杠（根路径 `/` 保留）。
-- 大小写**保留**（serve 区分大小写），但冲突检测走 `routePathKey()` 做小写归一。
-
-### `normalizeTargetPath(input): PathValidation`
-
-空串与 `/` 都归一化为 `""`（表示不追加路径）。
-
-### `buildProxyUrl(hostPort, targetPath='')` / `parseProxyUrl(raw)`
-
-- `buildProxyUrl(443, '/api/agent')` → `http://127.0.0.1:443/api/agent`。
-- `parseProxyUrl` 只接受 `http:`/`https:`，无法解析时返回 `null`（调用方据此放弃接管该路由）。
-
-### `isValidPort(value): value is number`
-
-1–65535 的整数。注意 `isValidPort('80') === false` —— 字符串端口必须在入参层就被拒绝。
-
-### `isLoopbackHost(host)`
-
-`127.0.0.1` / `localhost` / `::1`。**同时被 config 的监听校验与 app 的 Host 头校验复用**。
-
----
-
-## 3. `src/docker/` —— 容器清单
-
-### `resolveEndpoints(configured, env)` · `normalizePipeName(raw)` · `describeEndpoint(ep)`
-
-候选端点优先级：显式配置 → `DOCKER_HOST` → 平台默认（Windows: `dockerDesktopLinuxEngine` → `docker_engine` → `dockerDesktopWindowsEngine`；POSIX: `/var/run/docker.sock` → `/run/docker.sock`）。
-
-`normalizePipeName` 容忍 `npipe://./pipe/x`、`//./pipe/x`、`\\.\pipe\x`、`x` 四种写法。
-
-### `class DockerEngineClient implements DockerTransport`
-
-- `request<T>(path, opts)`：端点解析是**惰性**的，首个成功端点被缓存。请求失败（非 HTTP 错误码）时清空缓存并重新探测，兼容 Docker Desktop 重启与 WSL/Windows 引擎切换。
-- `endpoint()`：未连接时返回 `(未连接)`；**因此启动流程里有一次预热调用**（见 `main.ts`），否则启动日志会误导读者。
-- 传输层直接用 `node:http` 的 `socketPath` 走命名管道/Unix socket，不依赖 docker CLI，因此不需要解析人类可读输出。
-
-### `normalizePorts(raw)` —— 唯一一处「丢弃未发布端口」的地方
-
-`PublicPort` 缺失即未发布到宿主机 → 丢弃。同一端口若同时存在 IPv4(`0.0.0.0`) 与 IPv6(`::`) 两条记录，**两条都保留**：这是判断「容器是否绕过本工具直接监听 tailnet」的依据。
-
-### `normalizeContainer(raw)` · `class DockerContainerService`
-
-从 `/containers/json?all=1` 取数，只保留路由需要的字段，结果按容器名排序。
-
----
-
-## 4. `src/tailscale/` —— serve 控制面
-
-### `parseServeStatus(raw): ServeSnapshot`
-
-解析 `tailscale serve status --json`（legacy raw serve config format）：
-
-```json
-{ "TCP": { "443": { "HTTPS": true } },
-  "Web": { "<host>:<port>": { "Handlers": { "/path": { "Proxy": "http://127.0.0.1:8080" } } } } }
-```
-
-关键行为：
-
-- 无任何配置时 tailscale 输出 `{}` → 返回空快照而不是抛错。
-- 优先选择与 HTTPS 端口一致的那个 `Web` 键；否则取第一个。
-- 非 `Proxy` 的 handler（`Path` / `Text`）被识别为 `file` / `text`，不参与路由托管。
-
-### `parseHandler(value)` / `splitHostPort(key)` / `proxiedRoutes(snapshot)` / `snapshotHostname(snapshot)`
-
-`proxiedRoutes` 只保留「能解析出宿主机端口」的代理路由 —— 这是「可接管候选」的定义。
-
-### `class TailscaleCli`
-
-| 方法 | 实际命令 | 备注 |
-| --- | --- | --- |
-| `statusJson()` | `status --json` | |
-| `serveStatusJson()` | `serve status --json` | 空输出归一化为 `{}` |
-| `serveUpsert(path, proxy)` | `serve --bg --yes --set-path=<path> <proxy>` | **`--set-path` 必须在目标之前** |
-| `serveRemove(path)` | `serve --yes --set-path=<path> off` | 精确摘除单条，不影响同主机其它路径 |
-
-两处工程约束（均为真实环境实测结论）：
-
-1. **写操作一律带 `--yes`**，否则交互式确认会把常驻进程挂死。
-2. **刻意不用 `serve set-config`**。Tailscale 1.102 起 `set-config` 已转向 services 格式，喂给它 `serve status --json` 的原文会被判为 legacy 格式并警告 `ignoring node-level fields: TCP, Web` —— 即静默不生效。同时它的参数顺序要求 `set-config --all <file>`（文件必须在 `--all` 之后）。因此读用 JSON、写用 `--set-path`。
-
-`explain(args, stderr)` 把 CLI 的小写报错翻译成中文可读原因（访问被拒绝 / tailscaled 未运行 / tailnet 未启用 HTTPS）。
-
-### `class TailscaleServeGateway implements ServeGateway`
-
-映射层唯一可见的网关接口，暴露 `snapshot()` / `tailnet()` / `upsertRoute()` / `removeRoute()`。刻意不暴露 CLI 细节，测试可直接换成内存实现。
-
-### `parseTailnetInfo(raw)`
-
-去掉 `DNSName` 的尾点，拼出 `baseUrl = https://<dnsName>`。字段缺失时不抛错（Tailscale 未登录时界面仍应能打开）。
-
----
-
-## 5. `src/mappings/` —— 映射库与收敛
-
-### `src/mappings/store.ts`
-
-| 符号 | 说明 |
-| --- | --- |
-| `reviveMapping(raw, logger)` | 反序列化时的严格校验；非法条目**丢弃**而不是让脏数据流入后续流程 |
-| `FileMappingStore` | 单文件 JSON + 「临时文件 + rename」原子写 |
-| `MemoryMappingStore` | 测试用 |
-| `FileAuditLog` | JSONL 追加；内存缓存最近 1000 条 |
-| `MemoryAuditLog` | 测试用 |
-
-`reviveMapping` 的容忍边界：`path` 非法、`hostPort` 非法、`id` 缺失 → 丢弃；`targetPath === '/'` → 归一化为 `""`；`enabled` 缺失 → `true`。
-
-### `src/mappings/reconcile.ts` —— 全部是纯函数
-
-#### `isSameProxy(a, b)`
-
-先解析再比对 `host` / `hostPort` / `targetPath`，因此 `http://127.0.0.1:8080` 与 `http://127.0.0.1:8080/` 视为相同，避免每次 apply 都产生一次无意义的写入。解析失败时退化为字符串比较。
-
-#### `describeOrphan(mapping, containers)`
-
-仅对 `kind === 'container'` 生效，依次检查：容器是否存在（先按 id，再按 name）→ 是否 `running` → 是否仍发布该 `hostPort`。返回中文说明或 `null`。
-
-#### `evaluateMapping(mapping, snapshot, containers, adminPort)`
-
-单条映射的状态评估，判定顺序严格遵循第 1 节的状态优先级。**`adminPort` 判定在最前**，先于 `enabled`。
-
-#### `planReconcile(input): ReconcilePlan`
-
-产出 `upserts` / `removals` / `blocked` / `exposures` / `evaluations`。规则：
-
-- **期望集合**：`enabled === true` 且状态不是 `blocked` / `conflict` 的映射路径。
-- **upsert**：期望路径在 serve 中缺失，或与实际不一致。
-- **removal**（三个来源，全部去重）：
-  1. 某条映射的 `ownedPaths ∪ {path}` 中存在、但不在期望集合中的路径；
-  2. **任何**指向 `adminPort` 的 serve handler（无论是否本工具创建）——安全兜底；
-  3. `blocked` 状态映射在 serve 中残留的路径。
-- 同键重复路径的两条映射都判为 `conflict` 并跳过写入（正常流程由 `MappingService` 的更早校验拦住，此处是防御）。
-
-#### `isInSync(plan)`
-
-`upserts` 与 `removals` 均为空。注意 `exposures` 需单独判断 —— 暴露被摘除时会体现在 `removals` 里，但检测结果本身也要向用户展示。
-
-### `src/mappings/mapping-service.ts`
-
-#### `MappingService` 的并发模型
-
-所有「读-改-写」经 `#serialize()` 串行化。**注意**：`setEnabled()` 自身不入队，它读一次后直接委托给 `update()`；如果在 `setEnabled` 里再包一层 `#serialize`，会因为队列自等待而**死锁**。
-
-#### `create(input)` / `update(id, input)` / `#buildMapping(input, existing)`
-
-`#buildMapping` 集中做全部前置校验，按顺序：
-
-1. 路径归一化（非法 → `invalid-path`）
-2. 目标路径归一化（→ `invalid-target-path`）
-3. 端口范围（→ `invalid-port`）
-4. 同路径重复（→ `duplicate-path`）
-5. **`hostPort === adminPort` → `exposes-admin`（硬拒绝，且不写入 serve）**
-6. 路径被**未托管**的 serve 路由占用且未带 `confirmTakeover` → `takeover-required`
-
-第 5 条刻意放在第 6 条之前：即使该路径当前被一条未托管路由占用，也不能以「接管」的名义把它变成管理端口的出口。
-
-`#matchContainer(hostPort, containerId?)` 按宿主机端口反查容器，自动填充 `containerId` / `containerName` / `containerPort`，并把 `kind` 定为 `container`。
-
-#### `remove(id)`
-
-先从映射库删除，再用一条 **tombstone**（`enabled: false`，`ownedPaths` 含原路径）参与本次收敛 —— 这样「路径的摘除」和「记录的删除」由同一套差异计算处理，不需要为删除写第二套逻辑。
-
-#### `importExternal(paths?)`
-
-把 serve 中的未托管路由转为受管映射。**不写 serve**（只是认领），因此不会造成任何瞬时中断。跳过条件：不是可解析的本机代理路由，或指向管理端口。
-
-#### `applyInternal(overrideMappings?)`
-
-副作用的唯一集中点，顺序：
-
-```text
-plan → 逐条 upsert（失败收集到 errors，不中断）→ 逐条 remove（同上）
-     → 审计 → 回写 ownedPaths → 复查 exposures 并记录审计 → 重新评估得到 inSync
-```
-
-**回写 `ownedPaths` 的规则**：候选集为 `enabled ? [path, ...ownedPaths] : ownedPaths`，再与「收敛后仍存在于 serve 中的路径」求交。这样摘除失败时归属被保留，下次 apply 会自动重试。
-
-**收敛失败不回滚映射库** —— 用户意图必须留存，`pending` + `errors` 就是重试入口。
-
-#### `enforceExposureGuard()`
-
-启动闸门。与 `planReconcile` 的 exposure 分支功能重叠，但**刻意独立实现**：它不依赖映射库内容，因此即使映射库被写坏或为空，启动时也一定会执行一次全量扫描。`autoUnexpose === false` 时只记审计与 error 日志，不摘除。
-
----
-
-## 6. `src/config.ts` —— 配置
-
-### `loadConfig(overrides): AppConfig`
-
-**`TSCONTROLLER_HOST` 只接受回环地址，没有开关可绕过**。这是「本应用禁止暴露在 tailnet 中」的第一层实现，其余三层在 `app.ts`（Host 头）、`mapping-service.ts`（exposures 扫描）、`main.ts`（复核内核实际绑定地址）。
-
-`readInt` / `readBool` / `readStr`：非法值直接抛错（宁可启动失败，也不要带着一个悄悄回退的默认值运行）。
-
----
-
-## 7. `src/app.ts` —— HTTP 管理面
-
-### `buildApp(deps): FastifyInstance`
-
-| 层次 | 实现 |
-| --- | --- |
-| 错误映射 | `statusFor()`：`ZodError`→400、`MappingConflictError`→404/409、`TailscaleError`→502、`DockerApiError`→503、其余 500 |
-| Host 校验 | `onRequest` 钩子，主机名必须过 `isLoopbackHost()`，否则 403 `forbidden-host` |
-| 静态资源 | 仅当 `<WEB_ROOT>/index.html` 存在才注册 `@fastify/static`；否则 `/` 返回一段说明 API 已就绪的 HTML |
-| SPA 回落 | `setNotFoundHandler`：`/api/*` 返回 404 JSON，其余返回 `index.html` |
-
-`messageOf()` 对 `ZodError` 会把 `issues` 展平成 `字段: 原因; ...`，这样前端拿到的 `error` 字段直接可读。
-
----
-
-## 8. `src/runtime.ts` / `src/main.ts`
-
-### `createRuntime(overrides): Promise<Runtime>`
-
-依赖装配的唯一入口。每一层都可以通过 `RuntimeOverrides` 注入替身，因此端到端验证脚本与单测共用同一套装配逻辑。
-
-### `main()`
-
-启动顺序（顺序本身是设计的一部分）：
-
-```text
-1. createRuntime()                 读配置、建目录、装配
-2. enforceExposureGuard()          安全闸门 —— 先于监听
-3. containers.listContainers()     Docker 预热，让启动日志显示真实数据源
-4. app.listen()                    此时才开始对外提供管理接口
-5. 复核 server.address()           非回环则自我关闭
-6. 打印横幅 + 注册 SIGINT/SIGTERM 优雅退出
-```
-
-第 5 步是纵深防御：即使 `config` 与 `listen` 之间出现任何偏差（例如被中间件改写），进程也会自行退出而不是静默暴露。
-
----
-
-## 9. `web/` —— 管理界面（前端）
-
-Vite 6 + React 19 + TypeScript，无 UI 框架，纯手写 CSS。构建产物 `web/dist` 由后端以静态资源方式托管（见 `buildApp`）。
-
-### 构建配置的两个坑（已在文件注释中说明）
-
-1. **`vite.config.ts` 必须显式设置 `root`。** 启动命令是根目录下的 `vite --config web/vite.config.ts`，此时 Vite 默认会把 root 解析成配置文件所在目录，而 CLI 传入的 root 语义容易与 `--config` 叠加出错位；显式固定为 `web/` 的绝对路径后，`outDir` 才会落在 `web/dist`。
-2. **`web/tsconfig.json` 与根 `tsconfig.json` 是两套独立的编译环境。** 前端用 `moduleResolution: bundler` + `jsx: react-jsx` + `lib: DOM`；根配置用 `NodeNext` + `types: node`。`npm run lint` 依次跑两者。
-
-### `web/src/api.ts` —— 契约层
-
-**这是前端最有价值的一个文件**：它把后端的全部响应结构逐字写成 TS 类型（字段名不做任何映射），因此后端一旦改名，前端会立刻编译失败而不是运行期静默失效。
-
-| 符号 | 作用 |
-| --- | --- |
-| `ApiClient` / `createApi(base)` | 11 个接口的类型化封装；`api` 是走同源相对路径的默认实例 |
-| `class ApiError` | 携带 `status` 与后端返回的 `code`；`is(code)` 用于分支 |
-| `toApiError(err)` | 把任意抛出物（含 `AbortError`）归一化为 `ApiError`，中止的请求标记为 `aborted` |
-| `ERROR_CODE_LABEL` | `exposes-admin` / `takeover-required` 等错误码 → 中文提示前缀 |
-| `send()` | 统一 fetch：非 2xx 时优先解析 `{error, code}`，解析不出再退化为 `HTTP <status>` |
-
-### `web/src/utils.ts` —— 纯函数
-
-| 函数 | 说明 |
-| --- | --- |
-| `groupByStatus(mappings)` | 按 `MAPPING_STATUS_ORDER` 分组，**顺序即严重度**：blocked → conflict → orphaned → disabled-drift → pending → active → disabled |
-| `slugifyPath` / `defaultPathFor` | 容器名 → 默认路径（小写、非 `[a-z0-9._-]` 折成 `-`、去首尾 `-.`），空结果兜底 `app` |
-| `normalizePathInput` | 补前导 `/`、折叠重复斜杠；**不做更严格的校验**，非法路径交给后端拒绝并回显原因 |
-| `joinUrl` / `isWildcardHost` / `formatTime` / `formatTimestamp` / `copyText` | 复制走 `navigator.clipboard`，失败时回退到 `execCommand('copy')` 的隐藏 textarea |
-
-### 组件结构
-
-| 组件 | 职责 | 关键设计 |
-| --- | --- | --- |
-| `App` | 数据采集与写操作编排 | 见下 |
-| `TopBar` | tailnet 地址、管理地址、后端状态、数据源 | 地址均可一键复制 |
-| `Toolbar` | 刷新 / 重新同步 / 计划摘要 | `inSync` 用绿点，否则黄点并列出待挂载/待摘除/被阻止数量 |
-| `SecurityBanner` | 管理面暴露告警 | `safe` 时绿条；否则红条并逐条列出 `{path, proxy}` |
-| `ContainerPanel` | 容器清单与端口 | 端口绑定 `0.0.0.0`/`::` 时打「全网卡」徽标；`hostPort === adminPort` 时按钮禁用并打「管理端口」徽标 |
-| `ContainerMappingForm` | 内联建映射表单 | 收到 `takeover-required` 时**不报错**，而是就地展开「确认接管」二次确认区 |
-| `MappingPanel` / `MappingRow` / `EditRow` | 映射表格 | 按状态分组；行内编辑；删除需二次确认 |
-| `ExternalRoutesPanel` | 未托管路由 | 单条「接管」按钮 → `importRoutes([path])`；若 `skipped` 非空，把跳过原因原样展示 |
-| `Toast` / `CopyButton` / `shared.ts` | 反馈与通用件 | error 级 toast 常驻（需用户处理），其余 8 秒自动消失 |
-
-### `App` 的并发控制（易踩坑处）
-
-两套机制刻意分工，不要合并：
-
-- **请求序号 `seqRef`**：防竞态。每次采集递增，旧请求返回时序号已过期即丢弃结果。用 abort 上一次请求会让「刷新」在快速连点时抛出一堆 `AbortError`。
-- **`AbortController`**：只负责组件卸载时取消在途请求。React 19 StrictMode 会挂载两次，因此 controller 存在 ref 上、每次挂载都新建，避免第一次挂载的 cleanup 误伤第二次挂载发出的请求。
-
-`mutate()` 是所有写操作的统一外壳：包 busy 状态、转换错误、成功后自动 `refreshAll()`。返回 `{ data }` 表示成功，返回 `{ code, message }` 表示失败 —— 调用方据此区分「接管确认」等可重试分支。
-
-## 10. 测试与验证
-
-### 单元/接口测试（`npm test`，70 个）
-
-| 文件 | 覆盖 |
-| --- | --- |
-| `test/route-path.test.ts` | 路径归一化的接受/拒绝边界、代理地址往返、回环判定 |
-| `test/serve-config.test.ts` | 用**本机真实** `serve status --json` 的同构结构做解析回归；`parseTailnetInfo` 容错 |
-| `test/reconcile.test.ts` | 12 个差异计算场景，含「永不删除未托管路由」「改名摘旧挂新」「暴露摘除」「孤儿检测」「同路径冲突」 |
-| `test/mapping-service.test.ts` | 创建/更新/删除/启停/导入/安全闸门；含「写入失败后保留 pending 并可重试」「摘除失败后保留归属并可重试」 |
-| `test/api.test.ts` | 完整 REST 生命周期、409 的三种 code、400/404、DNS rebinding 防护 |
-| `test/config-and-docker.test.ts` | 非回环监听必须抛错、管道名归一化、未发布端口丢弃、`reviveMapping` 脏数据丢弃 |
-
-`test/fakes.ts` 提供 `FakeServeGateway`（内存 serve 配置 + 可注入的 upsert/remove 失败 + 调用轨迹）、`FakeContainerSource`、`makeContainer`。
-
-### 真实环境验证（需 Docker + Tailscale，不在沙箱内运行）
-
-- `scripts/verify-live.ts`：真实建映射 → 真实 HTTPS 请求 → 真实删映射，并逐条比对运行前后的 serve 路径集合。实测 9/9 通过（`HTTP 200`，响应 626 字节来自容器）。
-- `scripts/verify-security.ts`：真实复现「serve 中存在指向管理端口的路由」，验证被检测、被摘除、写入审计、且不误伤其它端口；再验证 API 拒绝建立该类映射。实测 10/10 通过。
-
-两个脚本都在 `finally` 中兜底摘除测试路径，并对「原有 serve 配置是否原样保留」做断言。
-
----
-
-## 11. 变更归档
 
 ### 2026-10-15 · 首个可用版本（全量新增）
 
@@ -598,12 +226,17 @@ Vite 6 + React 19 + TypeScript，无 UI 框架，纯手写 CSS。构建产物 `w
 
 | 符号 | 说明 |
 | --- | --- |
-| `SNAPSHOT_SCHEMA_VERSION` | schema 版本，字段语义变化时递增 |
-| `Snapshot` / `SnapshotRoute` / `SnapshotSummary` | 快照结构。每条路由含 `servePort`/`path`/`url`/`proxy`/`targetPath`/`targetHostPort`/`managed`/`mappingId`/`status`/`containerName`/`containerPort`/`note`/`enabled` |
+| `SNAPSHOT_SCHEMA_VERSION` | schema 版本，字段语义变化时递增。**当前 = 2**（v2 = 路由身份三元组 + Service 列表；v1 = 端口 + 路径） |
+| `Snapshot` / `SnapshotRoute` / `SnapshotSummary` | 快照结构。v2 起每条路由含 `service`/`host`/`path`/`url`/`proxy`/`targetPath`/`targetHost`/`targetHostPort`/`fromServiceConfig`/`managed`/`mappingId`/`status`/`containerName`/`containerPort`/`note`/`enabled`；顶层含 `services: ServiceInfo[]`；`source` 含 `magicDnsSuffix`/`selfTags`；`summary` 含 `awaitingApproval` |
 | `buildSnapshot(input): Snapshot` | **纯函数**。相同输入必得相同输出（`generatedAt` 由调用方注入），因此可穷举测试 |
 | `SnapshotWriter` | 写出器接口，便于注入内存实现 |
 | `FileSnapshotWriter` | 写 `<dir>/serve-routes.json`，**临时文件 + rename** 原子替换，消费方永远读不到半截 JSON |
 | `MemorySnapshotWriter` | 测试用 |
+
+**v2 的两处语义收缩（改动时不要回退）**：
+
+1. 路由的对外地址只看**快照自身的 `host`**（Service 级则用 Service 的 MagicDNS 名），不再拿 `tailnet.dnsName` 兜底——后者会在「读不到主机名」时产出一个看似可用、实际不该点开的链接。
+2. 远端目标（`handler.loopback === false`）**不做**容器端口反查，`containerSource` 保持 `null`（那是别的机器的容器清单）。
 
 **接线的关键决定**：
 
@@ -758,3 +391,169 @@ Vite 6 + React 19 + TypeScript，无 UI 框架，纯手写 CSS。构建产物 `w
 | 中文编码完好性 | ✅（用 .NET `UTF8Encoding($false)` 显式无 BOM 写入） |
 | `npm run lint` | 0 错 |
 | `npm test` | **119/119**（替换保持了夹具自洽性） |
+
+### 2026-10-17 · 静态文档从「单页」重构为「镜像目录树」（并接进校验）
+
+**起因**：需求方要求按 `code-static-documentation` 技能包重构静态文档。原先是**单个大文件** `docs/static/function-index.md`（992 行），不满足技能包的核心约定：**目录即索引**（文档目录树 = 源码目录树）、**一文件一文档**、函数级粒度。
+
+**做法（对应技能包六阶段）**：
+
+| 阶段 | 落地物 |
+| --- | --- |
+| Phase 0 准备 | `docs/static/.ignore`：显式登记忽略规则（版本控制 / 依赖 / 构建产物 / **运行时数据 `data/`** / 锁文件 / 二进制 / 本就是给人读的文档） |
+| Phase 1 枚举 | `docs/static/manifest.txt`：**一次性完整枚举**出的权威清单，带「状态 + 类别 + 相对路径」三列，是全流程唯一遍历依据 |
+| Phase 2 分类 | 57 条待归档（代码 43 / 配置 13 …）+ 9 条显式跳过；`docs/*.md` 与仓库根 `README.md`/`todo.md` 归为 `doc` 类**不生成镜像**（避免两份真相） |
+| Phase 3 生成 | 镜像文档 **57 份**，路径 = 源码相对路径 + `.md`；每份含「文件概述 / 依赖·引用 / 函数清单 / 函数详情（签名·入参·出参·功能·边缘条件）/ 全局常量 / 待办与隐患」 |
+| Phase 4 边缘条件 | 逐函数写清空值、默认值、异常分支、并发与资源释放；重点记录本项目特有的边界（命名空间不串味、远端目标不判孤儿、暴露只判回环、`awaiting-approval` 不算 pending、`get-config` 有损读取…） |
+| Phase 5 校验 | 新增 `scripts/verify-docs.ts`（`npm run verify:docs`），落地**四重校验**：数量 / 结构 / 覆盖 / 格式，外加一次「反向校验」防漏登记 |
+| Phase 6 交付 | `docs/static/README.md`（索引 + 阅读顺序 + 排除清单 + 校验报告 + 维护约定）；`history.md`（本文件，原 `function-index.md` 的 §11 迁入） |
+
+**删除了什么以及为什么**：`docs/static/function-index.md` 已删除——它的「当前代码结构」部分拆进了镜像文档，「变更归档」搬到了 `history.md`，索引职责由 `README.md` 承接。要回看旧形态：`git show <sha>:docs/static/function-index.md`。
+
+**过程中修掉的两个实质问题**（都不是业务代码，而是新写的校验脚本自己暴露的）：
+
+1. **校验脚本的跳过判定写错**：`manifest.txt` 里「状态」与「类别」是两列，最初的过滤条件把 `category === 'doc'` 的条目当成了待生成，于是 `README.md`/`todo.md` 一直报「缺少镜像文档」，并把「源文件数」算成 61（含依赖与运行时数据）。改为 `isSkipped()` 同时认 `category === 'skip' | 'doc'` 与显式 `skipped`。
+2. **函数提取口径过宽 → 制造假失败**：最初的正则把接口成员、对象字面量方法、`.then((res) => …)` 这类内联回调都算成「函数」，导致 `src/domain/types.ts`（纯类型，0 个函数）被判「按源码 4 个函数：property、method…」而失败。改成**只认三类形态**（顶层 `function`、`export const = (`、行尾带 `{` 的缩进类方法），并把方向定为「**宁可少算，不可多算**」——覆盖校验是下界校验，高估只会制造假失败。
+
+**验证**：
+
+| 检查 | 结果 |
+| --- | --- |
+| `node scripts/verify-docs.ts` | **四重校验全部通过**：待归档 57 = 已生成 57；文档函数条目 **300** ≥ 源码粗筛 **191**；结构/格式全部命中 |
+| `npm test` | **185/185**（重构未触碰业务代码；顺带修了 `test/fakes.ts` 里 `parseFakeRouteKey` 的文档注释与实现不一致——三个冒号的 Service 键写法现已明确支持） |
+| `npm run lint` | 0 错 |
+| `npm run web:build` | 成功 |
+
+**新增的 npm script**：`verify:docs`（校验）、`docs:stats`（校验并把统计表写回 `README.md` 的 STATS 标记区）。
+
+**已知遗留**：文档头统一记为「随本次提交」（生成与源码同一提交入库，没有可引用的历史 sha）；4 个前端组件与 3 个脚本的文档由并行子任务生成，风格以 `src/logger.ts.md` / `src/docker/docker-service.ts.md` 为范本。
+
+**顺带发现的既有问题（未在本提交修，仅登记）**：
+
+1. `web/src/components/shared.ts` 是**死代码**：全仓检索 `MutationHooks` / `ReportApply` / `DEFAULT_APPLY_OPTIONS` 只命中它自己；`App.tsx` 自带同形状的 `reportApply` 并把提示文案内联成字面量，形成两份同值真相。
+2. `SecurityBannerProps.onCopied` 是必选 prop 但函数体内完全未使用；且危险分支只看 `security.safe`，`safe === false` 且 `exposures` 为空时会渲染「检测到 0 条」+ 空 `<ul>`。
+3. `Toolbar` 的 `adminUrl` 只当可见性开关（`href` 硬编码 `/api/system`）。
+4. `App.pushToast` 头插截断到 6 条时不取消被丢弃 toast 的定时器；`applyNow` 调 `api.apply()` 未传 `AbortSignal`。
+5. 三处口径不一致：`App.managedKeys` 折叠 path 大小写而 `ExternalRoutesPanel.routeKey` 敏感；`EditRow` 的 path 只 `trim()` 而创建表单用 `normalizePathInput`；`StatusBadge` 的 `detail ?? meta.hint` 不兜空串。
+6. `scripts/verify-security.ts` 的 `TEST_ADMIN_PORT=8789` **未被校验是否空闲**（若被占用，「零暴露窗口」的推理不成立）；`verify-live.ts --service` 按名字字面比对，传裸名 `dsh` 会整个跳过 Service 轮。
+
+
+### 2026-10-17 · 前端跟进 Tailscale Service 级路由（路由身份升级为三元组）
+
+**范围**：仅 `web/**`（`src/` 与 `test/` 由并行的后端改动负责，本次未触碰）。后端把路由身份从 `(servePort, path)` 升级为 `(service, servePort, path)`、代理目标从固定 `127.0.0.1` 扩展为任意主机，本节的改动就是让界面与那份契约对齐。
+
+#### 契约层：`web/src/api.ts`（逐字镜像后端，仍是唯一真相入口）
+
+| 类型 | 改动 |
+| --- | --- |
+| `MappingStatus` | 新增 `'awaiting-approval'` |
+| `RouteRef` | 新增 `service: string \| null`（`null` = 节点级） |
+| `MappingTarget` | 新增 `remoteHost?` / `scheme?`；`hostPort` 的语义注释改为「`remoteHost` 省略时是本机端口」 |
+| `MappingView` | 新增 `service` / `baseUrl`；**`baseUrl` 是完整基址（不含路径），非 443 端口已带端口** |
+| `ServiceInfo` | 新增：`name` / `dnsName` / `servePorts` / `advertised` / `vipIps` |
+| `ExternalRoute` | 新增 `service` / `host` / `fromServiceConfig` / `serviceInfo` |
+| `SystemInfo` | 新增 `magicDnsSuffix` / `selfTags` / `canHostService` / `services` |
+| `MappingsResponse` | 新增 `services` / `selfTags` |
+| `ServeRoutesResponse` | 新增 `services` |
+| `ApplyResult.blocked` / `ImportResponse.skipped` | 均带上 `service` |
+| `Exposure` | 新增 `service` |
+| `ServeRouteView` | 新增 `service`；`ProxyHandler` 新增 `host` 与可选 `fromServiceConfig` |
+| `MappingInput` | 新增 `service?` / `remoteHost?` / `scheme?` |
+| `KNOWN_ERROR_CODES` / `ERROR_CODE_LABEL` | 新增 `invalid-service` / `invalid-remote-host` / `remote-host-requires-service` / `invalid-scheme` |
+
+#### `web/src/utils.ts`（新增 6 个纯函数，全部留在这一层）
+
+| 符号 | 说明与边缘条件 |
+| --- | --- |
+| `SERVICE_PREFIX` | 常量 `'svc:'`，与后端 `route-path.ts` 的同名常量对齐 |
+| `MAPPING_STATUS_ORDER` | `awaiting-approval` 插在 `pending` 与 `active` 之间（顺序 = 严重度：配置已写对，只差管理员点一下） |
+| `groupByStatus` | 组内排序由「仅路径」改为 `(service ?? '')` 再 `path`，避免节点级与 Service 级的路由交替出现 |
+| `normalizeServiceInput(input)` | 去空白、去掉裸 `svc:` 前缀、统一小写前缀为 `svc:dsh`；空串与「只有前缀」→ `""`（即节点级）。**刻意不做完整校验**，非法名交给后端按 `^[a-z0-9][a-z0-9._-]*$` 拒绝并回显原因（与 `normalizePathInput` 同一哲学）。注意 `svc:DSH` 会得到 `svc:DSH`（不折叠大写），后端会拒绝——这正是想要的行为，静默改写会指向另一个 Service |
+| `serviceShortName(service)` | `"svc:dsh"` → `"dsh"` |
+| `isRemoteTarget(target)` | `remoteHost` 非空且不是 `127.0.0.1`/`localhost` |
+| `formatTarget(target)` | `127.0.0.1:4173` / `my-laptop.example-tailnet.ts.net:3081`；**不含目标路径**，由调用方按需追加 |
+| `formatRouteLabel(servePort, path, service?)` | 新增可选第三参：`svc:dsh:443/`，即「`service:` + 非 443 端口 + 路径」。两个参数的老调用点行为逐字不变 |
+| `mappingUrl(mapping)` | `baseUrl + path`；`baseUrl` 为 `null`/`''` 时返回 `null`（复制按钮据此禁用） |
+| `formatScopedLabel(service, path)` | 只带 Service 没有端口时的标签，用于 `ApplyResult.blocked`（那里不含 `servePort`） |
+| `joinUrl(serveHost, servePort, path)` | **保留**（契约要求服务那些只有 `serveHost` 的节点级调用点）。本次改动后界面里已无调用者：映射行改用 `baseUrl`，只读路由表把主机名单独成列 |
+
+#### 组件改动
+
+| 组件 | 改动 |
+| --- | --- |
+| `ContainerMappingForm`（在 `ContainerPanel.tsx` 内） | 新增「Tailscale Service（可选）」输入（`留空 = 节点级路由；填 dsh 或 svc:dsh`）；填了 Service 才出现「代理目标主机」（`留空 = 本机 127.0.0.1；Service host 可代理远端主机`），端口字段相应改名为「目标主机端口」，否则叫「本机端口」。`system.services` 非空时挂 `<datalist>` 快速选择（未承认的会标「（等待审批）」）。`canHostService === false` 时在 Service 字段下方给 `warn-inline` 提示并给出两条出路（换 tagged 设备 / 给本机打 tag 后重新登录）。预览行按 Service 拼 `https://<short>.<tailnet>`，`takeover-required` 的就地二次确认流程与「挂载路径会被剥掉」提示原样保留 |
+| `MappingPanel` | 状态表补 `awaiting-approval`（文案「等待审批」、冷色 `status-approval`，**刻意不用红/黄**）；目标列改用 `formatTarget`；路由列加 Service 徽标（`节点级` 灰 / 短名蓝）；复制 URL 改为 `mappingUrl(mapping)`（`baseUrl` 为 null 时按钮自动禁用）；编辑行加 Service + 目标主机输入（非 Service 模式时目标主机禁用并给出「只在 Service 级支持」的原因），保存时显式下发 `service`（含 `null` = 切回节点级）以保证 PATCH 语义正确；本地校验「非 Service 模式填了远端主机」直接拦下 |
+| `ServicePanel.tsx`（**新增**） | 逐个列出 `ServiceInfo`：MagicDNS 名（可复制 `https://` 地址）、对外端口、TailVIP，以及 `已承认` / `等待审批` 徽标；未承认时给出管理后台批准路径与 `autoApprovers.services` 两个选项。无 tag 时在顶部解释本节点不可能充当 Service host。既无 Service 又无 tag 时只渲染一行提示 |
+| `ExternalRoutesPanel` | 新增 Service 列与「代理目标主机」列；接管改为发送 `{ service, servePort, path }`（**漏掉 service 会去接管另一条同名路由**）；`fromServiceConfig === true` 的行下方单独一行说明「目标路径不可恢复、接管后以空路径纳入管理、第一次 apply 会重写」——不藏在 tooltip 里 |
+| `SecurityBanner` | 暴露条目改用 `formatRouteLabel(servePort, path, service)`，节点级渲染结果与之前逐字相同 |
+| `Toolbar` | 新增 `counts` 入参；`awaiting-approval` 非零时在计划摘要里以冷色显示「· 等待审批 N 条」，hover 给出批准位置 |
+| `App` | 新增 `ServicePanel` 挂载点；`Toolbar` 传 `counts`；只读 serve 路由表新增 Service / 主机名列并把 `serveHost` 列语义写明为「节点级」；`reportApply` 的 upserted/removed/exposures/blocked 全部带上 Service；`managedKeys` 的键由 `port|path` 升级为 `service|port|path` |
+| `styles.css` | 新增 `.pill-calm` / `.status-approval` / `.badge-calm` / `.plan-calm` / `.detail-calm`（冷色，表达「不是错误」）、`.lossy-row`、`.edit-stack`、`.service-list` / `.service-card` / `.service-head` / `.service-grid` / `.service-vip` / `.service-help` |
+
+#### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `npx tsc -p web/tsconfig.json --noEmit` | **0 错** |
+| `npm run web:build` | 成功，40 modules → `web/dist`（css 12.10 kB / js 275.79 kB） |
+
+**未验证 / 已知边界**：
+
+1. 沙箱内无法打开浏览器，因此「界面真点一遍」仍需人工验收（`todo.md` 第 1 项）。本次只做到类型级 + 构建级验证。
+2. `npm run lint` 会连带跑后端 `tsc -p tsconfig.json --noEmit`，该处当时在 `test/**` 上有并行改动中的失败，因此未作为本次验收项；前端 `web/tsconfig.json` 单独跑是干净的。
+3. 表单里的 `<datalist>` 用 `useId()` 生成 id（形如 `«r1»`，含全角书名号）。HTML5 与 React 均合法，但如需兼容上古浏览器自测时注意。
+
+### 2026-10-17 · 后端实现 Tailscale Service 级路由（路由身份 = Service + 端口 + 路径）
+
+**起因**：需求方要的是 `dsh.<tailnet>.ts.net`，而不是 `<节点>.<tailnet>.ts.net/dsh`。此前（2026-10-15、2026-10-16 两节）的结论是「本机是用户账号身份，拿不到这种名字」，因此模型停在路径路由。本次把 Service 支持真正做进代码。
+
+#### 先做的三个事实核查（决定了整份设计）
+
+1. **`tailscale serve status --json` 里没有 Service**，本机 1.102.4 实测只有 `TCP` + `Web` 两段；Service 端点只在 `tailscale serve get-config --all`（`{"version":"0.0.1","services":{...}}`）里。上游 [tailscale#18289](https://github.com/tailscale/tailscale/issues/18289) 明说这两个命令返回的信息不同。
+   → **这是一个与「只解析 443」同类的安全缺口**：只读 `status --json` 的闸门对 Service 路由完全瞎。所以读路径改成「两个源合并」。
+2. **Service host 只能代理本机**的假设不成立。上游 `ipn/serve.go` 的 `ExpandProxyTargetValue` 注释写着 *"If it's for a service, remote addresses are allowed"*，并且对非 localhost 目标要求带 scheme、允许不带端口。官方文档亦写 host *"can advertise both local and remote resources"*。
+   → 目标模型必须支持远端主机，否则 NAS 当 host、应用在笔记本上的用法根本表达不出来。
+3. **Service 端点配置的读取是有损的**。上游 `runServeGetConfig` 只序列化根 handler（`Handlers["/"]`）与端点映射，且用 `net.SplitHostPort` 拆 Proxy —— **目标路径会丢**。
+   → 所以 Service 路由的目标路径以**映射库为唯一权威**；读回来的值只用于状态判定，绝不用于重建配置。
+
+#### 改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/domain/types.ts` | `Mapping.service`、`OwnedRoute.service`、`ServeRoute.service`、`RouteRef.service`；`MappingTarget.remoteHost?`/`scheme?`；新增 `ServiceInfo`；`MappingStatus` 新增 `awaiting-approval`；`MappingView.baseUrl`；`ServeSnapshot.services`；`TailnetInfo.magicDnsSuffix`/`tags`/`serviceHosts`；`ServeHandler['proxy']` 新增 `host`/`fromServiceConfig?` |
+| `src/domain/route-path.ts` | 新增 `normalizeServiceName`（接受 `dsh`/`svc:dsh`，统一为 `svc:dsh`；**大写直接拒绝而不是折叠**——静默改写会指向另一个不存在的 Service）、`serviceShortName`、`buildServiceDnsName`/`suffixFromNodeDnsName`、`normalizeRemoteHost`（回环视为「未指定远端」）；`serveRouteKey(service, port, path)`（节点级用 `-` 占位）；`buildProxyUrl` 改为对象入参并保留旧的两参重载；`parseProxyUrl` 显式拒绝 `https+insecure://` |
+| `src/tailscale/serve-config.ts` | 新增 `parseEndpointKey` / `parseServiceTarget` / `parseServiceConfig` / `mergeServeSnapshots` / `serviceInfoOf`；`parseServeStatus` 的路由补 `service: null` 与 `handler.host` |
+| `src/tailscale/tailscale-cli.ts` | `serveUpsert`/`serveRemove` 加可选 `service`（`--service` 必须在 `--https` 之前）；新增 `serveGetConfig()`（`get-config --all`，空输出归一化为 `{}`）与 `serveClear()`（`serve clear svc:x`，该命令**不接受** `--yes`）；`explain()` 增加 tagged node 的可读中文解释 |
+| `src/tailscale/tailscale-service.ts` | 新增 `parseServiceHostCap()`（`Self.CapMap["service-host"]`，兼容对象与数组两种序列化形态）；`snapshot()` 合并两个来源，`get-config` 失败**只降级不致命** |
+| `src/mappings/reconcile.ts` | 全部匹配/去重/归属改用三元组键；`desiredProxyOf()`；`awaitingApprovalOf()`；暴露扫描加 `loopback` 条件；`blocked`/`exposures`/`upserts`/`removals` 全部带 `service` |
+| `src/mappings/mapping-service.ts` | `MappingInput.service`/`remoteHost`/`scheme`；校验顺序新增 `invalid-service` / `invalid-remote-host` / `remote-host-requires-service` / `invalid-scheme`；远端目标不参与容器反查与孤儿检测；`importExternal` 支持 Service 端点（远端→`remoteHost`，目标路径按空串接管并在备注里写明）；`services()` / `canHostService()` |
+| `src/mappings/store.ts` | `reviveMapping` 迁移 `service`（缺失=节点级）、`remoteHost`/`scheme`；`reviveOwnedRoutes` 的键改用 `serveRouteKey` |
+| `src/snapshot.ts` | `SNAPSHOT_SCHEMA_VERSION` **1 → 2**；路由加 `service`/`host`/`targetHost`/`fromServiceConfig`；顶层加 `services`；`source` 加 `magicDnsSuffix`/`selfTags`；`summary` 加 `awaitingApproval`；暴露条目加 `service` |
+| `src/app.ts` | 请求体加 `service`/`remoteHost`/`scheme`；`/api/system` 加 `magicDnsSuffix`/`selfTags`/`canHostService`/`services`，暴露判定加 `loopback` 条件；`/api/serve/routes` 加 `services`；import 请求体加 `service` |
+| `scripts/verify-live.ts` | 抽出 `round()`，节点级与 Service 级共用「建→真实请求→删→比对」；新增 `--service` / `--remote-host`；前提不满足时**跳过**而不是失败 |
+| `scripts/verify-security.ts` | 新增 E 段：Service 命名空间里的暴露必须被检测并摘除，且该 Service 上的既有端点不被牵连 |
+
+#### 三个新决策（后续不应推翻）
+
+1. **`advertised` 的缺省值不可信。** 解析层只在配置里**显式**写了 `advertised: true` 时才认；本节点是否真被承认为 host，唯一证据是 `status --json` 的 `Self.CapMap["service-host"]`。否则一条本地写坏或半成品的配置会让界面误报 `active`。
+2. **暴露闸门只判 loopback 目标。** `remoteHost` 上的同名端口与本进程无关，把它判成 `blocked` 会让 NAS 上的正常服务无法映射。代价是一个**已登记的盲点**：Service host 反向代理到**本机**的管理端口时，配置里只有远端主机名，本工具无法判断那台主机就是本机——这一层只能靠 ACL 与「不要在 host 上写这种目标」保证。
+3. **`awaiting-approval` 是独立状态，不是 `pending`。** 配置已经写对了、`inSync` 也为真，缺的是管理员批准广告；把它混进 `pending` 会让用户反复点「应用」却毫无变化。
+
+#### 验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `npm run lint`（后端 + 前端两套 tsconfig） | 0 错 |
+| `npm test` | **185/185**（自 136 增加 49：`test/service-config.test.ts` 20 个 + `test/service-routing.test.ts` 22 个 + 既有用例的 v2 契约更新） |
+| `npm run web:build` | 成功（40 modules） |
+| `node scripts/verify-live.ts --port 8080` | **9/9**（真实 HTTPS → HTTP 200 / 674 字节；7 条既有路由逐字保留） |
+| `node scripts/verify-security.ts` | **14/14**（含非默认端口暴露的回归断言） |
+| 真实进程 + 真 CLI 冒烟 | 临时实例 8799：`/api/system` 返回 `magicDnsSuffix`/`selfTags`/`canHostService`/`services`；快照落盘为 `schemaVersion=2`；`POST /api/mappings` 建节点级映射 → `status=active`；`PATCH` 改成 `service=svc:smoketest` + `remoteHost` → 映射库正确留存、`desiredProxy` 为远端地址、`baseUrl` 为 `https://smoketest.tail921448.ts.net`，写入失败原因回显为中文的「Service host 必须使用 tag 身份…」 |
+
+**未验证（重要，不要当成已验证）**：Service 那一轮端到端（真实 `--service` 写入 + 经 `<svc>.<tailnet>.ts.net` 真实访问）**没有跑过**——本机 `Self.Tags` 为空，且撰写时 `tailscale status` 里没有任何已 tagged 的对端设备。目前 Service 链路的证据只有三条：单元测试（假网关，覆盖写维度、远端目标、审批状态、导入、闸门）、解析层对着上游实现与官方样例的同构输入、以及**真实 CLI 对未打 tag 节点给出的拒绝**（证明命令拼装与错误翻译确实走到了真 CLI）。补齐方式：在 NAS 上打 tag 并跑 `node scripts/verify-live.ts --service svc:<名字> --remote-host <本机 DNS 名>`。
+
+**过程中修掉的实质问题**：
+
+1. `LocalBackend`/`serve` 上游把 Service 端点目标写成 `tcp://host:port`，最初把它当成错误丢弃，导致一条**存在但看不见**的端点从界面上消失。改为归为 `other` 只读展示——与本工具对节点级非代理 handler 的既有处理保持一致。
+2. `httpsPorts` 最初的判定用的是端点键协议（`tcp:443`），于是 `tcp:8080 → https://nas:8443` 这种「L4 监听 + HTTPS 目标」的端点不被计入安全扫描范围。改为按**目标**协议判定。
+3. `buildSnapshot` 的 URL 曾用 `tailnet.dnsName` 兜底，导致「读不到快照主机名」时产出一个看似可用、实际不该点开的链接。改为只用快照自身的 `host`（Service 级则用 Service 的 MagicDNS 名）。

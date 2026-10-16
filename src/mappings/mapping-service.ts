@@ -5,13 +5,17 @@
  *   映射库 = 期望状态；serve 配置 = 实际状态；apply() = 收敛动作。
  * 每次增删改都会自动触发一次 apply，失败也不会回滚映射库，而是留下一个
  * `pending` 状态让用户重试——这样「用户意图」永远不会因为一次 CLI 抖动而丢失。
+ *
+ * 路由身份是 `(service, servePort, path)`：节点级与 Service 级是两个命名空间。
  */
 
 import { randomUUID } from 'node:crypto';
 import {
   normalizeRoutePath,
   normalizeTargetPath,
-  buildProxyUrl,
+  normalizeServiceName,
+  normalizeRemoteHost,
+  buildBaseUrl,
   isValidPort,
   serveRouteKey,
   formatRouteRef,
@@ -27,11 +31,13 @@ import type {
   RouteRef,
   ServeRoute,
   ServeSnapshot,
+  ServiceInfo,
+  TailnetInfo,
 } from '../domain/types.ts';
 import type { Logger } from '../logger.ts';
 import type { ContainerSource } from '../docker/docker-service.ts';
 import type { ServeGateway } from '../tailscale/tailscale-service.ts';
-import { isInSync, planReconcile, type ReconcilePlan } from './reconcile.ts';
+import { desiredProxyOf, isInSync, planReconcile, type ReconcilePlan } from './reconcile.ts';
 import type { AuditLog, MappingStore } from './store.ts';
 import { buildSnapshot, type Snapshot, type SnapshotWriter } from '../snapshot.ts';
 
@@ -57,7 +63,7 @@ export interface MappingServiceDeps {
 }
 
 export interface ApplyResult {
-  /** 本次真正写入的路由位置（端口 + 路径）。 */
+  /** 本次真正写入的路由位置（Service + 端口 + 路径）。 */
   upserted: RouteRef[];
   /** 本次真正摘除的路由位置。 */
   removed: RouteRef[];
@@ -77,6 +83,15 @@ export interface MappingInput {
   /** 对外 HTTPS 端口；省略时用配置里的默认端口。 */
   servePort?: number;
   targetPath?: string;
+  /**
+   * 关联的 Tailscale Service，接受 `dsh` 或 `svc:dsh` 两种写法。
+   *
+   * 传 `''`/`null` 表示节点级路由；省略则沿用已有值（更新时）。
+   */
+  service?: string | null;
+  /** 代理目标主机；省略即本机。 */
+  remoteHost?: string | null;
+  scheme?: 'http' | 'https';
   kind?: MappingTarget['kind'];
   containerId?: string;
   containerName?: string;
@@ -100,6 +115,8 @@ export class MappingService {
   readonly #deps: MappingServiceDeps;
   /** 串行化所有「读-改-写」，避免并发请求互相覆盖。 */
   #queue: Promise<unknown> = Promise.resolve();
+  /** 最近一次成功读取的 tailnet 身份，供界面拼 Service 地址；读失败时为 null。 */
+  #tailnet: TailnetInfo | null = null;
 
   constructor(deps: MappingServiceDeps) {
     this.#deps = deps;
@@ -120,20 +137,41 @@ export class MappingService {
     await this.#deps.audit.append({ at: new Date().toISOString(), kind, message, ...(detail ? { detail } : {}) });
   }
 
+  /** 读取 tailnet 身份；失败不影响主干流程（只影响界面上的地址显示）。 */
+  async #readTailnet(): Promise<TailnetInfo | null> {
+    try {
+      this.#tailnet = await this.#deps.gateway.tailnet();
+      return this.#tailnet;
+    } catch (err) {
+      this.#deps.logger.warn('读取 tailnet 身份失败（界面上的访问地址可能不完整）', {
+        error: (err as Error).message,
+      });
+      return this.#tailnet;
+    }
+  }
+
   /** 读取全部映射并计算实时状态。 */
   async #evaluateAll(): Promise<{
     mappings: Mapping[];
     plan: ReconcilePlan;
     containers: ContainerInfo[];
     snapshot: ServeSnapshot;
+    tailnet: TailnetInfo | null;
   }> {
-    const [mappings, snapshot, containers] = await Promise.all([
+    const [mappings, snapshot, containers, tailnet] = await Promise.all([
       this.#deps.store.read(),
       this.#deps.gateway.snapshot(),
       this.#deps.containers.listContainers(),
+      this.#readTailnet(),
     ]);
-    const plan = planReconcile({ mappings, snapshot, containers, adminPort: this.#deps.adminPort });
-    return { mappings, plan, containers, snapshot };
+    const plan = planReconcile({
+      mappings,
+      snapshot,
+      containers,
+      adminPort: this.#deps.adminPort,
+      tailnet,
+    });
+    return { mappings, plan, containers, snapshot, tailnet };
   }
 
   #toView(m: Mapping, plan: ReconcilePlan): MappingView {
@@ -141,8 +179,9 @@ export class MappingService {
     return {
       ...m,
       status: ev?.status ?? 'pending',
-      desiredProxy: ev?.desiredProxy ?? buildProxyUrl(m.target.hostPort, m.target.targetPath),
+      desiredProxy: ev?.desiredProxy ?? desiredProxyOf(m.target),
       actualProxy: ev?.actualProxy ?? null,
+      baseUrl: ev?.baseUrl ?? null,
       detail: ev?.detail ?? null,
     };
   }
@@ -151,39 +190,63 @@ export class MappingService {
   async overview(): Promise<{
     mappings: MappingView[];
     externalRoutes: Array<{
+      service: string | null;
       servePort: number;
       path: string;
       proxy: string | null;
       hostPort: number | null;
+      host: string | null;
       kind: string;
+      /** 从 Service 配置读到的端点（其 handler 树不完整，只能读不能据此重建）。 */
+      fromServiceConfig: boolean;
+      /** Service 级路由对应的 Service 状态；非 Service 路由为 null。 */
+      serviceInfo: ServiceInfo | null;
     }>;
+    services: ServiceInfo[];
+    /** 当前节点是否有 tag 身份（Service host 的前提）。 */
+    selfTags: string[];
     planSummary: { upserts: number; removals: number; blocked: number; exposures: number; inSync: boolean };
     counts: Record<MappingStatus, number>;
   }> {
-    const { mappings, plan, snapshot } = await this.#evaluateAll();
+    const { mappings, plan, snapshot, tailnet } = await this.#evaluateAll();
     const managedKeys = this.#ownedKeys(mappings);
 
     const externalRoutes: Array<{
+      service: string | null;
       servePort: number;
       path: string;
       proxy: string | null;
       hostPort: number | null;
+      host: string | null;
       kind: string;
+      fromServiceConfig: boolean;
+      serviceInfo: ServiceInfo | null;
     }> = [];
     for (const r of snapshot.routes) {
-      if (managedKeys.has(serveRouteKey(r.servePort, r.path))) continue;
+      if (managedKeys.has(serveRouteKey(r.service, r.servePort, r.path))) continue;
       externalRoutes.push({
+        service: r.service,
         servePort: r.servePort,
         path: r.path,
         proxy: r.handler.kind === 'proxy' ? r.handler.raw : null,
         hostPort: r.handler.kind === 'proxy' ? r.handler.hostPort : null,
+        host: r.handler.kind === 'proxy' ? (r.handler.host ?? null) : null,
         kind: r.handler.kind,
+        fromServiceConfig: r.handler.kind === 'proxy' && r.handler.fromServiceConfig === true,
+        serviceInfo: r.service
+          ? (snapshot.services.find((s) => s.name.toLowerCase() === r.service!.toLowerCase()) ?? null)
+          : null,
       });
     }
-    externalRoutes.sort((a, b) => a.servePort - b.servePort || a.path.localeCompare(b.path));
+    externalRoutes.sort(
+      (a, b) =>
+        a.servePort - b.servePort ||
+        (a.service ?? '').localeCompare(b.service ?? '') ||
+        a.path.localeCompare(b.path),
+    );
 
     const views = mappings.map((m) => this.#toView(m, plan));
-    const counts = {
+    const counts: Record<MappingStatus, number> = {
       active: 0,
       pending: 0,
       disabled: 0,
@@ -191,12 +254,15 @@ export class MappingService {
       'orphaned-target': 0,
       blocked: 0,
       conflict: 0,
-    } satisfies Record<MappingStatus, number>;
+      'awaiting-approval': 0,
+    };
     for (const v of views) counts[v.status] += 1;
 
     return {
       mappings: views,
       externalRoutes,
+      services: snapshot.services,
+      selfTags: tailnet?.tags ?? [],
       planSummary: {
         upserts: plan.upserts.length,
         removals: plan.removals.length,
@@ -208,10 +274,10 @@ export class MappingService {
     };
   }
 
-  /** 某条映射当前声明占用的全部位置键（含当前 servePort+path）。 */
+  /** 某条映射当前声明占用的全部位置键（含当前 service+servePort+path）。 */
   #ownedKeysOf(m: Mapping): string[] {
-    return [...m.ownedRoutes, { servePort: m.servePort, path: m.path }].map((r) =>
-      serveRouteKey(r.servePort, r.path),
+    return [...m.ownedRoutes, { service: m.service, servePort: m.servePort, path: m.path }].map((r) =>
+      serveRouteKey(r.service, r.servePort, r.path),
     );
   }
 
@@ -247,6 +313,42 @@ export class MappingService {
       throw new MappingConflictError('invalid-port', `宿主机端口必须是 1-65535 的整数，当前为 ${String(input.hostPort)}`);
     }
 
+    // Service：空串/null 一律归一化为「节点级」；非法名直接拒绝（静默改写会指向不存在的 Service）。
+    const hasServiceInput = input.service !== undefined;
+    const serviceCheck = normalizeServiceName(input.service ?? null);
+    let service: string | null;
+    if (input.service === undefined) {
+      service = existing?.service ?? null;
+    } else if (input.service === null || input.service === '') {
+      service = null;
+    } else if (!serviceCheck.ok) {
+      throw new MappingConflictError('invalid-service', `Service 名非法：${serviceCheck.reason}`);
+    } else {
+      service = serviceCheck.service;
+    }
+
+    const remoteCheck = normalizeRemoteHost(
+      input.remoteHost !== undefined ? input.remoteHost : (existing?.target.remoteHost ?? null),
+    );
+    if (!remoteCheck.ok) {
+      throw new MappingConflictError('invalid-remote-host', `代理目标主机非法：${remoteCheck.reason}`);
+    }
+    const remoteHost = remoteCheck.host;
+
+    // 远端目标只在 Service 场景下有意义：节点级的 serve 由本机 tailscaled 承载，
+    // 语义上也可以代理远端，但本工具把它限定在 Service 上，避免两种模型混用。
+    if (remoteHost !== null && service === null) {
+      throw new MappingConflictError(
+        'remote-host-requires-service',
+        `代理到远端主机（${remoteHost}）只在 Service 级路由上支持；节点级路由请使用本机端口。`,
+      );
+    }
+
+    const scheme = input.scheme ?? existing?.target.scheme;
+    if (scheme !== undefined && scheme !== 'http' && scheme !== 'https') {
+      throw new MappingConflictError('invalid-scheme', `代理协议只能是 http 或 https，当前为 ${String(scheme)}`);
+    }
+
     const servePort = input.servePort ?? existing?.servePort ?? this.#deps.servePort;
     if (!isValidPort(servePort)) {
       throw new MappingConflictError(
@@ -255,8 +357,8 @@ export class MappingService {
       );
     }
 
-    // 目标端口就是管理端口 → 直接拒绝，避免把管理面写进 tailnet。
-    if (input.hostPort === this.#deps.adminPort) {
+    // 目标端口就是管理端口 → 直接拒绝，避免把管理面写进 tailnet（仅对本机目标）。
+    if (remoteHost === null && input.hostPort === this.#deps.adminPort) {
       throw new MappingConflictError(
         'exposes-admin',
         `端口 ${this.#deps.adminPort} 是 TsController 管理端口，禁止建立任何指向它的映射。`,
@@ -272,31 +374,36 @@ export class MappingService {
     }
 
     const mappings = await this.#deps.store.read();
-    const key = serveRouteKey(servePort, pathCheck.path);
+    const key = serveRouteKey(service, servePort, pathCheck.path);
     const duplicate = mappings.find(
-      (m) => m.id !== existing?.id && serveRouteKey(m.servePort, m.path) === key,
+      (m) => m.id !== existing?.id && serveRouteKey(m.service, m.servePort, m.path) === key,
     );
     if (duplicate) {
       throw new MappingConflictError(
         'duplicate-path',
-        `端口 ${servePort} 上的路径 ${pathCheck.path} 已被映射 ${duplicate.id} 占用`,
+        `${service ?? '节点级'} 端口 ${servePort} 上的路径 ${pathCheck.path} 已被映射 ${duplicate.id} 占用`,
       );
     }
 
     // 目标位置被「未托管」的 serve 路由占用时，必须显式确认接管。
     const snapshot = await this.#deps.gateway.snapshot();
     const managedKeys = this.#ownedKeys(mappings);
-    const occupant = snapshot.routes.find((r) => serveRouteKey(r.servePort, r.path) === key);
+    const occupant = snapshot.routes.find((r) => serveRouteKey(r.service, r.servePort, r.path) === key);
     if (occupant && !managedKeys.has(key) && !input.confirmTakeover) {
       throw new MappingConflictError(
         'takeover-required',
-        `端口 ${servePort} 上的路径 ${pathCheck.path} 已被 serve 中的未托管路由占用` +
+        `${service ?? '节点级'} 端口 ${servePort} 上的路径 ${pathCheck.path} 已被 serve 中的未托管路由占用` +
           `（${occupant.handler.raw}）。若确认接管，请附加 confirmTakeover=true。`,
       );
     }
 
-    const matched = input.kind === 'host' ? {} : await this.#matchContainer(input.hostPort, input.containerId);
-    const kind: MappingTarget['kind'] = input.kind ?? (matched.containerId ? 'container' : 'host');
+    // 远端目标不可能是本机容器的已发布端口。
+    const matched =
+      input.kind === 'host' || remoteHost !== null
+        ? {}
+        : await this.#matchContainer(input.hostPort, input.containerId);
+    const kind: MappingTarget['kind'] =
+      input.kind ?? (remoteHost !== null ? 'host' : matched.containerId ? 'container' : 'host');
     const now = new Date().toISOString();
 
     const target: MappingTarget = {
@@ -304,15 +411,20 @@ export class MappingService {
       hostPort: input.hostPort,
       targetPath: targetCheck.path,
     };
-    const containerId = input.containerId ?? matched.containerId;
-    const containerName = input.containerName ?? matched.containerName;
-    const containerPort = input.containerPort ?? matched.containerPort;
-    if (kind === 'container' && containerId) target.containerId = containerId;
-    if (kind === 'container' && containerName) target.containerName = containerName;
-    if (kind === 'container' && containerPort !== undefined) target.containerPort = containerPort;
+    if (remoteHost !== null) target.remoteHost = remoteHost;
+    if (scheme !== undefined) target.scheme = scheme;
+    if (remoteHost === null) {
+      const containerId = input.containerId ?? matched.containerId;
+      const containerName = input.containerName ?? matched.containerName;
+      const containerPort = input.containerPort ?? matched.containerPort;
+      if (kind === 'container' && containerId) target.containerId = containerId;
+      if (kind === 'container' && containerName) target.containerName = containerName;
+      if (kind === 'container' && containerPort !== undefined) target.containerPort = containerPort;
+    }
 
     return {
       id: existing?.id ?? randomUUID(),
+      service,
       path: pathCheck.path,
       servePort,
       target,
@@ -331,8 +443,9 @@ export class MappingService {
       const mappings = await this.#deps.store.read();
       mappings.push(mapping);
       await this.#deps.store.write(mappings);
-      await this.#audit('apply', `创建映射 ${mapping.path} → http://127.0.0.1:${mapping.target.hostPort}`, {
+      await this.#audit('apply', `创建映射 ${formatRouteRef(mapping)} → ${desiredProxyOf(mapping.target)}`, {
         mappingId: mapping.id,
+        service: mapping.service,
       });
       const apply = await this.applyInternal();
       const view = await this.#viewOf(mapping.id);
@@ -355,6 +468,9 @@ export class MappingService {
         targetPath: input.targetPath ?? existing.target.targetPath,
         note: input.note ?? existing.note,
         enabled: input.enabled ?? existing.enabled,
+        ...(input.service !== undefined ? { service: input.service } : {}),
+        ...(input.remoteHost !== undefined ? { remoteHost: input.remoteHost } : {}),
+        ...(input.scheme !== undefined ? { scheme: input.scheme } : {}),
         ...(input.kind !== undefined ? { kind: input.kind } : {}),
         ...(input.containerId !== undefined ? { containerId: input.containerId } : {}),
         ...(input.containerName !== undefined ? { containerName: input.containerName } : {}),
@@ -364,7 +480,7 @@ export class MappingService {
       const updated = await this.#buildMapping(merged, existing);
       mappings[index] = updated;
       await this.#deps.store.write(mappings);
-      await this.#audit('apply', `更新映射 ${updated.servePort}:${updated.path}`, { mappingId: updated.id });
+      await this.#audit('apply', `更新映射 ${formatRouteRef(updated)}`, { mappingId: updated.id });
       const apply = await this.applyInternal();
       const view = await this.#viewOf(updated.id);
       return { mapping: view, apply };
@@ -386,14 +502,19 @@ export class MappingService {
         enabled: false,
         ownedRoutes: [
           ...found.ownedRoutes.filter(
-            (r) => !(r.servePort === found.servePort && r.path.toLowerCase() === found.path.toLowerCase()),
+            (r) =>
+              !(
+                (r.service ?? null) === (found.service ?? null) &&
+                r.servePort === found.servePort &&
+                r.path.toLowerCase() === found.path.toLowerCase()
+              ),
           ),
-          { servePort: found.servePort, path: found.path },
+          { service: found.service, servePort: found.servePort, path: found.path },
         ],
       };
       const apply = await this.applyInternal([...rest, tombstone]);
       await this.#deps.store.write(rest);
-      await this.#audit('apply', `删除映射 ${found.servePort}:${found.path}`, { mappingId: found.id });
+      await this.#audit('apply', `删除映射 ${formatRouteRef(found)}`, { mappingId: found.id });
       return { removed: found, apply };
     });
   }
@@ -415,66 +536,75 @@ export class MappingService {
   /**
    * 把 serve 中已有的未托管路由导入为受管映射。
    *
-   * 用于接管用户此前手工配置的 `tailscale serve --set-path` 规则。
+   * 两个来源都会被导入（这正是「接管」的价值所在——手工敲的命令行也能进映射库）：
+   * - 节点级：`tailscale serve --set-path` 写下的路由；
+   * - Service 级：`get-config --all` 读到的 Service 端点。
+   *
+   * Service 级路由的目标路径**无法从 `get-config` 读回**（上游实现只序列化主机与
+   * 端口），因此导入时 `targetPath` 一律为空串——如果原本带路径，第一次 apply
+   * 会按空路径重写。这是已知的有损点，界面上会标注。
    */
   async importExternal(
-    selection?: Array<{ servePort: number; path: string }>,
+    selection?: Array<{ service?: string | null; servePort: number; path: string }>,
   ): Promise<{
     imported: Mapping[];
-    skipped: Array<{ servePort: number; path: string; reason: string }>;
+    skipped: Array<{ service: string | null; servePort: number; path: string; reason: string }>;
   }> {
     return this.#serialize(async () => {
       const [mappings, snapshot] = await Promise.all([this.#deps.store.read(), this.#deps.gateway.snapshot()]);
       const managedKeys = this.#ownedKeys(mappings);
       const imported: Mapping[] = [];
-      const skipped: Array<{ servePort: number; path: string; reason: string }> = [];
+      const skipped: Array<{ service: string | null; servePort: number; path: string; reason: string }> = [];
       const wanted = selection
-        ? new Set(selection.map((s) => serveRouteKey(s.servePort, s.path)))
+        ? new Set(selection.map((s) => serveRouteKey(s.service ?? null, s.servePort, s.path)))
         : null;
 
       for (const route of snapshot.routes) {
-        const key = serveRouteKey(route.servePort, route.path);
+        const key = serveRouteKey(route.service, route.servePort, route.path);
         if (managedKeys.has(key)) continue;
         if (wanted && !wanted.has(key)) continue;
+        const skip = (reason: string): void => {
+          skipped.push({ service: route.service, servePort: route.servePort, path: route.path, reason });
+        };
         if (route.handler.kind !== 'proxy' || route.handler.hostPort === null) {
-          skipped.push({ servePort: route.servePort, path: route.path, reason: '不是可接管的本机代理路由' });
+          skip('不是可接管的 HTTP(S) 代理路由（tcp/unix/text 等形态本工具不托管）');
           continue;
         }
-        if (route.handler.hostPort === this.#deps.adminPort) {
-          skipped.push({
-            servePort: route.servePort,
-            path: route.path,
-            reason: '指向 TsController 管理端口，禁止接管',
-          });
+        if (route.handler.loopback && route.handler.hostPort === this.#deps.adminPort) {
+          skip('指向 TsController 管理端口，禁止接管');
           continue;
         }
         if (route.servePort === this.#deps.adminPort) {
-          skipped.push({
-            servePort: route.servePort,
-            path: route.path,
-            reason: '对外端口与 TsController 管理端口同号，禁止接管',
-          });
+          skip('对外端口与 TsController 管理端口同号，禁止接管');
           continue;
         }
-        const matched = await this.#matchContainer(route.handler.hostPort);
+
+        const remoteHost = route.handler.loopback ? null : (route.handler.host ?? null);
+        const matched = remoteHost === null ? await this.#matchContainer(route.handler.hostPort) : {};
         const now = new Date().toISOString();
         const target: MappingTarget = {
-          kind: matched.containerId ? 'container' : 'host',
+          kind: remoteHost !== null ? 'host' : matched.containerId ? 'container' : 'host',
           hostPort: route.handler.hostPort,
-          targetPath: route.handler.targetPath,
+          // Service 端点的目标路径无法从 get-config 读回，只能按空路径接管。
+          targetPath: route.handler.fromServiceConfig === true ? '' : route.handler.targetPath,
         };
+        if (remoteHost !== null) target.remoteHost = remoteHost;
         if (matched.containerId) target.containerId = matched.containerId;
         if (matched.containerName) target.containerName = matched.containerName;
-        if (matched.containerPort !== undefined) target.containerPort = matched.containerPort;
+        if (matched.containerPort !== undefined && remoteHost === null) target.containerPort = matched.containerPort;
 
         imported.push({
           id: randomUUID(),
+          service: route.service,
           path: route.path,
           servePort: route.servePort,
           target,
-          note: '从现有 tailscale serve 配置导入',
+          note:
+            route.handler.fromServiceConfig === true
+              ? '从现有 Tailscale Service 端点导入（目标路径以空路径接管，apply 后会按映射库重写）'
+              : '从现有 tailscale serve 配置导入',
           enabled: true,
-          ownedRoutes: [{ servePort: route.servePort, path: route.path }],
+          ownedRoutes: [{ service: route.service, servePort: route.servePort, path: route.path }],
           createdAt: now,
           updatedAt: now,
         });
@@ -484,7 +614,7 @@ export class MappingService {
       if (imported.length > 0) {
         await this.#deps.store.write([...mappings, ...imported]);
         await this.#audit('import', `接管 ${imported.length} 条既有 serve 路由`, {
-          routes: imported.map((m) => `${m.servePort}:${m.path}`),
+          routes: imported.map(formatRouteRef),
         });
       }
       return { imported, skipped };
@@ -513,16 +643,16 @@ export class MappingService {
 
     for (const u of plan.upserts) {
       try {
-        await this.#deps.gateway.upsertRoute(u.servePort, u.path, u.proxy);
-        upserted.push({ servePort: u.servePort, path: u.path });
+        await this.#deps.gateway.upsertRoute(u.servePort, u.path, u.proxy, u.service);
+        upserted.push({ service: u.service, servePort: u.servePort, path: u.path });
       } catch (err) {
         errors.push(`挂载 ${formatRouteRef(u)} 失败：${(err as Error).message}`);
       }
     }
     for (const r of plan.removals) {
       try {
-        await this.#deps.gateway.removeRoute(r.servePort, r.path);
-        removed.push({ servePort: r.servePort, path: r.path });
+        await this.#deps.gateway.removeRoute(r.servePort, r.path, r.service);
+        removed.push({ service: r.service, servePort: r.servePort, path: r.path });
       } catch (err) {
         errors.push(`摘除 ${formatRouteRef(r)} 失败：${(err as Error).message}`);
       }
@@ -539,18 +669,18 @@ export class MappingService {
     // 这样摘除失败或用户手工回滚都能在下次 apply 时被重试。
     const current = await this.#deps.store.read();
     const after = await this.#deps.gateway.snapshot();
-    const presentKeys = new Set(after.routes.map((r) => serveRouteKey(r.servePort, r.path)));
+    const presentKeys = new Set(after.routes.map((r) => serveRouteKey(r.service, r.servePort, r.path)));
     const refreshed = current.map((m) => {
       const candidates: OwnedRoute[] = m.enabled
-        ? [...m.ownedRoutes, { servePort: m.servePort, path: m.path }]
+        ? [...m.ownedRoutes, { service: m.service, servePort: m.servePort, path: m.path }]
         : [...m.ownedRoutes];
       const owns: OwnedRoute[] = [];
       const seen = new Set<string>();
       for (const c of candidates) {
-        const k = serveRouteKey(c.servePort, c.path);
+        const k = serveRouteKey(c.service, c.servePort, c.path);
         if (!presentKeys.has(k) || seen.has(k)) continue;
         seen.add(k);
-        owns.push({ servePort: c.servePort, path: c.path });
+        owns.push({ service: c.service, servePort: c.servePort, path: c.path });
       }
       return { ...m, ownedRoutes: owns };
     });
@@ -558,12 +688,12 @@ export class MappingService {
 
     if (plan.exposures.length > 0) {
       await this.#audit('exposure-detected', `检测到 ${plan.exposures.length} 条指向管理端口的路由`, {
-        exposures: plan.exposures,
+        exposures: plan.exposures.map((e) => ({ route: formatRouteRef(e), proxy: e.proxy })),
         autoRemove: this.#deps.autoUnexpose,
       });
-      const removedKeys = new Set(removed.map((r) => serveRouteKey(r.servePort, r.path)));
+      const removedKeys = new Set(removed.map((r) => serveRouteKey(r.service, r.servePort, r.path)));
       for (const e of plan.exposures) {
-        if (removedKeys.has(serveRouteKey(e.servePort, e.path))) {
+        if (removedKeys.has(serveRouteKey(e.service, e.servePort, e.path))) {
           await this.#audit('exposure-removed', `已摘除暴露管理端口的 serve 路由 ${formatRouteRef(e)}`, {
             proxy: e.proxy,
           });
@@ -610,23 +740,14 @@ export class MappingService {
     return this.#deps.snapshot.filePath;
   }
 
-  /** 组装快照所需的状态。 */
-  async #snapshotState(): Promise<{
-    mappings: Mapping[];
-    plan: ReconcilePlan;
-    snapshot: ServeSnapshot;
-    containers: ContainerInfo[];
-  }> {
-    return this.#evaluateAll();
-  }
-
   async #publishSnapshot(state: {
     mappings: Mapping[];
     plan: ReconcilePlan;
     snapshot: ServeSnapshot;
     containers: ContainerInfo[];
+    tailnet: TailnetInfo | null;
   }): Promise<Snapshot> {
-    const tailnet = await this.#deps.gateway.tailnet();
+    const tailnet = state.tailnet ?? (await this.#deps.gateway.tailnet());
     const snapshot = buildSnapshot({
       generatedAt: new Date().toISOString(),
       generator: 'tscontroller',
@@ -642,14 +763,19 @@ export class MappingService {
     return snapshot;
   }
 
-  async #planFor(mappings: Mapping[]): Promise<{ mappings: Mapping[]; plan: ReconcilePlan; containers: ContainerInfo[] }> {
-    const [snapshot, containers] = await Promise.all([
+  async #planFor(mappings: Mapping[]): Promise<{
+    mappings: Mapping[];
+    plan: ReconcilePlan;
+    containers: ContainerInfo[];
+  }> {
+    const [snapshot, containers, tailnet] = await Promise.all([
       this.#deps.gateway.snapshot(),
       this.#deps.containers.listContainers(),
+      this.#readTailnet(),
     ]);
     return {
       mappings,
-      plan: planReconcile({ mappings, snapshot, containers, adminPort: this.#deps.adminPort }),
+      plan: planReconcile({ mappings, snapshot, containers, adminPort: this.#deps.adminPort, tailnet }),
       containers,
     };
   }
@@ -664,18 +790,24 @@ export class MappingService {
   /**
    * 启动时的安全闸门。
    *
-   * 无论映射库内容如何，只要 serve 中存在指向管理端口的路由，就必须处理：
+   * 无论映射库内容如何，只要 serve 中存在指向管理端口的**本机**路由，就必须处理：
    * - 开启自动修复时立即摘除并记录审计；
    * - 否则只告警，交由界面提示用户手动处理。
    *
-   * **扫描范围是全部 HTTPS 端口**，不只是 443。早期实现只解析一个端口组，
-   * 导致挂在其它端口上的暴露对本闸门不可见——这是一个真实的安全缺口。
+   * **扫描范围是全部 HTTPS 端口 × 全部命名空间**（节点级 + Service 级）。
+   * 早期实现只解析一个端口组，后来又漏掉了 Service 命名空间——两者都是真实的
+   * 安全缺口，`get-config` 的接入正是为了堵上后者。
+   *
+   * **已知无法覆盖**：Service host 代理到**远端**本机（例如 NAS 上的 service host
+   * 反过来指向本机的管理端口）时，配置里只有远端主机名，本工具无法判断那台主机
+   * 是否就是本机。这一层需要靠 ACL 与「不要在 service host 上写这种目标」来保证。
    */
   async enforceExposureGuard(): Promise<{ exposures: ReconcilePlan['exposures']; removed: RouteRef[] }> {
     const snapshot = await this.#deps.gateway.snapshot();
     const exposures = snapshot.routes
-      .filter((r) => r.handler.kind === 'proxy' && r.handler.hostPort === this.#deps.adminPort)
+      .filter((r) => r.handler.kind === 'proxy' && r.handler.hostPort === this.#deps.adminPort && r.handler.loopback)
       .map((r) => ({
+        service: r.service,
         servePort: r.servePort,
         path: r.path,
         proxy: (r.handler as { raw: string }).raw,
@@ -697,8 +829,8 @@ export class MappingService {
     const removed: RouteRef[] = [];
     for (const e of exposures) {
       try {
-        await this.#deps.gateway.removeRoute(e.servePort, e.path);
-        removed.push({ servePort: e.servePort, path: e.path });
+        await this.#deps.gateway.removeRoute(e.servePort, e.path, e.service);
+        removed.push({ service: e.service, servePort: e.servePort, path: e.path });
         await this.#audit('exposure-removed', `已摘除暴露管理端口的 serve 路由 ${formatRouteRef(e)}`, {
           proxy: e.proxy,
         });
@@ -720,8 +852,21 @@ export class MappingService {
       for (const k of this.#ownedKeysOf(m)) owner.set(k, m.id);
     }
     return snapshot.routes.map((r) => {
-      const id = owner.get(serveRouteKey(r.servePort, r.path));
+      const id = owner.get(serveRouteKey(r.service, r.servePort, r.path));
       return { ...r, managed: id !== undefined, mappingId: id ?? null };
     });
+  }
+
+  /** Service 状态视图（供界面展示「已承认 / 等待审批」与 TailVIP）。 */
+  async services(): Promise<ServiceInfo[]> {
+    const snapshot = await this.#deps.gateway.snapshot();
+    return snapshot.services;
+  }
+
+  /** 本节点是否有 tag 身份（Service host 的前提条件）；无法读取 tailnet 时为 null。 */
+  async canHostService(): Promise<{ tags: string[]; canHostService: boolean } | null> {
+    const tailnet = await this.#readTailnet();
+    if (!tailnet) return null;
+    return { tags: tailnet.tags, canHostService: tailnet.tags.length > 0 };
   }
 }

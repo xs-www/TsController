@@ -1,9 +1,26 @@
 /** 映射面板：表格展示、编辑、启停、删除受管映射。 */
-import { useState, type JSX } from 'react';
+import { useState, useId, type JSX } from 'react';
 import { ERROR_CODE_LABEL } from '../api';
-import type { MappingCounts, MappingInput, MappingMutationResponse, MappingStatus, MappingView, PlanSummary } from '../api';
+import type {
+  MappingCounts,
+  MappingInput,
+  MappingMutationResponse,
+  MappingStatus,
+  MappingView,
+  PlanSummary,
+  ServiceInfo,
+} from '../api';
 import { CopyButton } from './CopyButton';
-import { formatRouteLabel, formatTime, groupByStatus, joinUrl } from '../utils';
+import {
+  formatRouteLabel,
+  formatTarget,
+  formatTime,
+  groupByStatus,
+  isRemoteTarget,
+  mappingUrl,
+  normalizeServiceInput,
+  serviceShortName,
+} from '../utils';
 
 /**
  * 写操作的结果反馈：`data` 有值表示成功（已刷新数据），否则用 `code`/`message`
@@ -25,8 +42,8 @@ export interface MappingPanelProps {
   loading: boolean;
   /** TsController 管理端口，用于本地拦截非法目标端口。 */
   adminPort: number;
-  /** serve 主机名（不含端口），用于拼出访问地址。 */
-  serveHost: string | null;
+  /** 当前节点上的 Tailscale Service，用于编辑行的快速选择。 */
+  services: ServiceInfo[];
   busy: boolean;
   updateMapping: (id: string, input: MappingInput) => Promise<MutationResult>;
   deleteMapping: (id: string) => Promise<ApiResult<unknown>>;
@@ -41,6 +58,17 @@ interface StatusMeta {
   hint: string;
 }
 
+/**
+ * `awaiting-approval` 的完整说明。
+ *
+ * 这一条不是错误：配置已经写对了，缺的是「本节点被承认为该 Service 的 host」。
+ * 因此文案刻意给出可执行的下一步（去哪里点批准），而不是让用户对着黄灯猜。
+ */
+const AWAITING_APPROVAL_HELP =
+  '配置已经正确写入 serve，但本节点还不是该 Service 被承认的 host，因此对外暂时不通。' +
+  '请在 Tailscale 管理后台批准广告：Services → 该 Service → Service hosts → Approve；' +
+  '或在 ACL 里配置 autoApprovers.services 让它自动通过。';
+
 /** 状态徽标的文案、配色与含义说明。 */
 const STATUS_META: Record<MappingStatus, StatusMeta> = {
   active: { label: '已生效', cls: 'status-active', hint: 'serve 配置与期望一致' },
@@ -50,6 +78,7 @@ const STATUS_META: Record<MappingStatus, StatusMeta> = {
   'orphaned-target': { label: '目标失联', cls: 'status-orphan', hint: '目标容器没有运行中的容器发布该端口' },
   blocked: { label: '被阻止', cls: 'status-blocked', hint: '该映射会暴露管理端口，被安全策略拒绝' },
   conflict: { label: '路径冲突', cls: 'status-conflict', hint: '期望路径被外部未托管路由占用' },
+  'awaiting-approval': { label: '等待审批', cls: 'status-approval', hint: AWAITING_APPROVAL_HELP },
 };
 
 function StatusBadge({ status, detail }: { status: MappingStatus; detail: string | null }): JSX.Element {
@@ -61,30 +90,36 @@ function StatusBadge({ status, detail }: { status: MappingStatus; detail: string
   );
 }
 
+/** 目标列的人类可读描述：代理到哪（`formatTarget`）+ 背后的容器。 */
 function targetText(m: MappingView): string {
   const t = m.target;
+  const endpoint = formatTarget(t);
   if (t.kind === 'container') {
     const name = t.containerName ?? t.containerId?.slice(0, 12) ?? '未知容器';
     const from = t.containerPort === undefined ? '?' : String(t.containerPort);
-    return `${name} · ${from} → ${String(t.hostPort)}`;
+    return `${endpoint} · 容器 ${name} ${from}`;
   }
-  return `宿主端口 ${String(t.hostPort)}`;
+  return endpoint;
 }
 
-/** 行内编辑表单：路径、本机端口、目标路径、备注。 */
+/** 行内编辑表单：Service、对外端口、目标主机/端口、目标路径、备注。 */
 function EditRow({
   mapping,
+  services,
   busy,
   adminPort,
   onSave,
   onCancel,
 }: {
   mapping: MappingView;
+  services: ServiceInfo[];
   busy: boolean;
   adminPort: number;
   onSave: (input: MappingInput) => Promise<MutationResult>;
   onCancel: () => void;
 }): JSX.Element {
+  const [service, setService] = useState(mapping.service ?? '');
+  const [remoteHost, setRemoteHost] = useState(mapping.target.remoteHost ?? '');
   const [path, setPath] = useState(mapping.path);
   const [servePort, setServePort] = useState(String(mapping.servePort));
   const [hostPort, setHostPort] = useState(String(mapping.target.hostPort));
@@ -93,11 +128,16 @@ function EditRow({
   const [pendingTakeover, setPendingTakeover] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const serviceListId = useId();
+
+  const normalizedService = normalizeServiceInput(service);
+  const serviceMode = normalizedService !== '';
+  const trimmedRemoteHost = remoteHost.trim();
 
   const save = async (confirmTakeover: boolean): Promise<void> => {
     const parsedPort = Number(hostPort);
     if (!Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
-      setError('本机端口必须是 1-65535 的整数');
+      setError('目标端口必须是 1-65535 的整数');
       return;
     }
     const parsedServePort = Number(servePort);
@@ -105,12 +145,17 @@ function EditRow({
       setError('对外端口必须是 1-65535 的整数');
       return;
     }
-    if (parsedPort === adminPort) {
+    // 远端目标才可能与远端同名端口重合；本机目标仍然禁止指向管理端口。
+    if (trimmedRemoteHost === '' && parsedPort === adminPort) {
       setError(`端口 ${String(adminPort)} 是 TsController 管理端口，禁止映射`);
       return;
     }
     if (parsedServePort === adminPort) {
       setError(`对外端口 ${String(adminPort)} 与管理端口同号，请换一个`);
+      return;
+    }
+    if (!serviceMode && trimmedRemoteHost !== '') {
+      setError('代理目标主机只在 Service 级路由上支持：请先填写 Tailscale Service，或清空目标主机');
       return;
     }
     if (path.trim() === '' || !path.trim().startsWith('/')) {
@@ -126,6 +171,9 @@ function EditRow({
         servePort: parsedServePort,
         targetPath,
         note,
+        // 显式下发（含 null = 切回节点级），避免 PATCH 语义把旧 Service 留下。
+        service: serviceMode ? normalizedService : null,
+        remoteHost: serviceMode && trimmedRemoteHost !== '' ? trimmedRemoteHost : null,
         kind: mapping.target.kind,
         ...(mapping.target.kind === 'container' && mapping.target.containerId !== undefined
           ? { containerId: mapping.target.containerId }
@@ -165,14 +213,38 @@ function EditRow({
     <>
       <tr className="row-open">
         <td>
-          <input
-            className="input mono"
-            value={path}
-            aria-label="路径"
-            onChange={(e) => {
-              setPath(e.target.value);
-            }}
-          />
+          <div className="edit-stack">
+            <span className="muted small">Service</span>
+            <input
+              className="input mono"
+              value={service}
+              placeholder="留空 = 节点级；填 dsh 或 svc:dsh"
+              aria-label="Tailscale Service"
+              list={services.length > 0 ? serviceListId : undefined}
+              onChange={(e) => {
+                setService(e.target.value);
+              }}
+            />
+            {services.length > 0 ? (
+              <datalist id={serviceListId}>
+                {services.map((s) => (
+                  <option key={s.name} value={s.name}>
+                    {s.dnsName ?? serviceShortName(s.name)}
+                    {s.advertised ? '' : '（等待审批）'}
+                  </option>
+                ))}
+              </datalist>
+            ) : null}
+            <span className="muted small">路径</span>
+            <input
+              className="input mono"
+              value={path}
+              aria-label="路径"
+              onChange={(e) => {
+                setPath(e.target.value);
+              }}
+            />
+          </div>
         </td>
         <td>
           <div className="edit-target">
@@ -187,12 +259,33 @@ function EditRow({
                 setServePort(e.target.value);
               }}
             />
-            <span className="muted small">{mapping.target.kind === 'container' ? '容器' : '宿主'}端口</span>
+            <span className="muted small">目标主机</span>
+            <input
+              className="input mono"
+              value={remoteHost}
+              placeholder={serviceMode ? '留空 = 本机 127.0.0.1' : '只在 Service 级支持'}
+              aria-label="代理目标主机"
+              disabled={!serviceMode}
+              title={
+                serviceMode
+                  ? '代理目标所在主机；留空即本机回环 127.0.0.1'
+                  : '远端目标只支持 Service 级路由：请先填写 Service'
+              }
+              onChange={(e) => {
+                setRemoteHost(e.target.value);
+              }}
+            />
+            <span className="muted small">{serviceMode ? '目标主机端口' : '本机端口'}</span>
             <input
               className="input mono input-port"
               value={hostPort}
               inputMode="numeric"
-              aria-label="本机端口"
+              aria-label="目标端口"
+              title={
+                serviceMode
+                  ? '该端口属于上面那台「代理目标主机」，不是本机'
+                  : '本机（127.0.0.1）上被代理的端口'
+              }
               onChange={(e) => {
                 setHostPort(e.target.value);
               }}
@@ -252,7 +345,11 @@ function EditRow({
             {pendingTakeover !== null ? (
               <div className="inline-confirm" role="alert">
                 <p>
-                  路径 <code className="mono">{path.trim()}</code> 当前被一条未托管的 serve 路由占用：{pendingTakeover}
+                  路由{' '}
+                  <code className="mono">
+                    {formatRouteLabel(Number(servePort) || 443, path.trim(), serviceMode ? normalizedService : null)}
+                  </code>{' '}
+                  当前被一条未托管的 serve 路由占用：{pendingTakeover}
                 </p>
                 <p className="muted">接管后该路径将由 TsController 管理，原 handler 会被覆盖。</p>
                 <div className="row-actions">
@@ -290,7 +387,7 @@ function MappingRow({
   mapping,
   editing,
   busy,
-  serveHost,
+  services,
   adminPort,
   onStartEdit,
   onStopEdit,
@@ -303,8 +400,7 @@ function MappingRow({
   mapping: MappingView;
   editing: boolean;
   busy: boolean;
-  /** serve 主机名（不含端口）。 */
-  serveHost: string | null;
+  services: ServiceInfo[];
   adminPort: number;
   onStartEdit: () => void;
   onStopEdit: () => void;
@@ -315,12 +411,16 @@ function MappingRow({
   onCopied: MappingPanelProps['onCopied'];
 }): JSX.Element {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const fullUrl = joinUrl(serveHost, mapping.servePort, mapping.path);
+  // baseUrl 由后端给出（Service 级是 service 的 MagicDNS 名，节点级是节点名），
+  // 已经带上非 443 端口，因此这里只需拼接路径。
+  const fullUrl = mappingUrl(mapping);
+  const label = formatRouteLabel(mapping.servePort, mapping.path, mapping.service);
 
   if (editing) {
     return (
       <EditRow
         mapping={mapping}
+        services={services}
         busy={busy}
         adminPort={adminPort}
         onCancel={onStopEdit}
@@ -331,7 +431,7 @@ function MappingRow({
             onNotify(
               'success',
               '映射已更新',
-              `${formatRouteLabel(updated.servePort, updated.path)} → ${updated.desiredProxy}`,
+              `${formatRouteLabel(updated.servePort, updated.path, updated.service)} → ${updated.desiredProxy}`,
             );
             onStopEdit();
           }
@@ -345,12 +445,21 @@ function MappingRow({
     <tr>
       <td>
         <div className="path-cell">
-          <code className="mono path-text">{formatRouteLabel(mapping.servePort, mapping.path)}</code>
+          {mapping.service === null ? (
+            <span className="pill pill-grey" title="节点级路由：对外主机名是本节点">
+              节点级
+            </span>
+          ) : (
+            <span className="pill pill-blue" title={`Tailscale Service：${mapping.service}`}>
+              {serviceShortName(mapping.service)}
+            </span>
+          )}
+          <code className="mono path-text">{label}</code>
           <CopyButton
-            value={fullUrl ?? mapping.path}
+            value={fullUrl}
             label="复制 URL"
             className="btn btn-mini btn-ghost"
-            title={fullUrl ?? 'tailnet 地址未知，将复制路径'}
+            title={fullUrl ?? '对外主机名未知（无法拼出完整地址），暂时无法复制'}
             onResult={(ok, v) => {
               onCopied(ok, '访问地址', v);
             }}
@@ -358,7 +467,9 @@ function MappingRow({
           {mapping.ownedRoutes.length > 1 ? (
             <span
               className="muted small"
-              title={`曾占用位置：${mapping.ownedRoutes.map((r) => formatRouteLabel(r.servePort, r.path)).join(', ')}`}
+              title={`曾占用位置：${mapping.ownedRoutes
+                .map((r) => formatRouteLabel(r.servePort, r.path, r.service))
+                .join(', ')}`}
             >
               占用 {mapping.ownedRoutes.length} 条
             </span>
@@ -368,7 +479,9 @@ function MappingRow({
       <td>
         <div className="mono">{targetText(mapping)}</div>
         <div className="muted small">
-          {mapping.target.kind === 'container' ? '容器' : '宿主'} · 目标路径 {mapping.target.targetPath === '' ? '（不追加）' : mapping.target.targetPath}
+          {mapping.target.kind === 'container' ? '容器' : '宿主'} ·{' '}
+          {isRemoteTarget(mapping.target) ? '远端目标' : '本机'} · 目标路径{' '}
+          {mapping.target.targetPath === '' ? '（不追加）' : mapping.target.targetPath}
         </div>
       </td>
       <td>
@@ -383,6 +496,11 @@ function MappingRow({
       <td className="note-cell">
         <div className={mapping.note === '' ? 'muted' : ''}>{mapping.note === '' ? '（无备注）' : mapping.note}</div>
         {mapping.detail !== null ? <div className="detail-text small">{mapping.detail}</div> : null}
+        {mapping.status === 'awaiting-approval' ? (
+          <div className="detail-calm small">
+            {AWAITING_APPROVAL_HELP}
+          </div>
+        ) : null}
         <div className="muted small" title={`创建 ${mapping.createdAt} / 更新 ${mapping.updatedAt}`}>
           更新于 {formatTime(mapping.updatedAt)}
         </div>
@@ -418,7 +536,7 @@ function MappingRow({
                 setConfirmDelete(false);
                 void deleteMapping(mapping.id).then((result) => {
                   if (result.data !== undefined) {
-                    onNotify('success', '映射已删除', mapping.path);
+                    onNotify('success', '映射已删除', label);
                   }
                 });
               }}
@@ -463,7 +581,7 @@ export function MappingPanel({
   planSummary,
   loading,
   adminPort,
-  serveHost,
+  services,
   busy,
   updateMapping,
   deleteMapping,
@@ -485,6 +603,9 @@ export function MappingPanel({
                 counts.conflict,
               )}`
             : ''}
+          {counts !== null && counts['awaiting-approval'] > 0
+            ? ` · 等待审批 ${String(counts['awaiting-approval'])}`
+            : ''}
           {planSummary !== null && !planSummary.inSync ? ` · 需同步 ${String(planSummary.upserts + planSummary.removals)} 项` : ''}
         </span>
       </header>
@@ -497,7 +618,7 @@ export function MappingPanel({
         <table className="mapping-table">
           <thead>
             <tr>
-              <th>路由（端口 + 路径）</th>
+              <th>路由（Service + 端口 + 路径）</th>
               <th>目标</th>
               <th>状态</th>
               <th>期望 / 实际代理</th>
@@ -527,7 +648,7 @@ export function MappingPanel({
                     mapping={m}
                     editing={editingId === m.id}
                     busy={busy}
-                    serveHost={serveHost}
+                    services={services}
                     adminPort={adminPort}
                     onStartEdit={() => {
                       setEditingId(m.id);

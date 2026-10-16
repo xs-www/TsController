@@ -45,7 +45,7 @@ export class ExecFileRunner implements CommandRunner {
             reject(err);
             return;
           }
-          const code = err ? ((err as { code?: number }).code ?? 1) : 0;
+          const code = err ? ((err as { code?: unknown }).code as number ?? 1) : 0;
           resolve({ code, stdout: stdout ?? '', stderr: stderr ?? '' });
         },
       );
@@ -65,6 +65,15 @@ function explain(args: string[], stderr: string): string {
   if (text.includes('serve is not enabled') || text.includes('https is not enabled')) {
     return '该 tailnet 未启用 HTTPS 证书，请在 Tailscale 管理后台开启 HTTPS Certificates。';
   }
+  if (text.includes('tagged node') || text.includes('must be tagged')) {
+    return (
+      'Service host 必须使用 tag 身份。本节点当前是用户账号拥有的设备，' +
+      '因此无法承载 Tailscale Service——请改用一台已打 tag 的设备（例如 NAS）作为 service host。'
+    );
+  }
+  if (text.includes('unknown flag') || text.includes('unknown subcommand')) {
+    return `当前 tailscale 版本不支持该命令（${args.join(' ')}），请升级 Tailscale 客户端。`;
+  }
   return `tailscale ${args.join(' ')} 执行失败（退出码非 0）。`;
 }
 
@@ -72,6 +81,9 @@ function explain(args: string[], stderr: string): string {
  * tailscale CLI 客户端。
  *
  * 所有写操作都使用 `--yes` 以避免交互式确认把常驻进程挂死。
+ *
+ * **Service 与节点级是两套命名空间**：`--service=svc:x` 的命令只作用于该
+ * Service 的配置组，与节点级的 `Web`/`TCP` 配置互不影响。
  */
 export class TailscaleCli {
   readonly #bin: string;
@@ -119,35 +131,57 @@ export class TailscaleCli {
     }
   }
 
-  /** `tailscale serve status --json`；无 serve 配置时 tailscale 输出 `{}`。 */
+  /**
+   * `tailscale serve status --json`；无 serve 配置时 tailscale 输出 `{}`。
+   *
+   * **只包含节点级路由**，Service 端点要用 `serveGetConfig()` 读。
+   */
   async serveStatusJson(): Promise<unknown> {
     const out = await this.#runOrThrow(['serve', 'status', '--json']);
+    return this.#parseJson(out, ['serve', 'status', '--json']);
+  }
+
+  /**
+   * `tailscale serve get-config --all`：本节点作为 Service host 的端点配置。
+   *
+   * 空输出（或 `{}`）归一化为 `{}` —— 本节点不是任何 Service 的 host 时
+   * tailscale 会打印 `{}`，那是正常状态而不是错误。
+   */
+  async serveGetConfig(): Promise<unknown> {
+    const out = await this.#runOrThrow(['serve', 'get-config', '--all']);
+    return this.#parseJson(out, ['serve', 'get-config', '--all']);
+  }
+
+  #parseJson(out: string, args: string[]): unknown {
     const trimmed = out.trim();
     if (trimmed === '') return {};
     try {
       return JSON.parse(trimmed);
     } catch {
       throw new TailscaleError(
-        'tailscale serve status --json 返回了无法解析的 JSON。',
-        ['serve', 'status', '--json'],
+        `tailscale ${args.join(' ')} 返回了无法解析的 JSON。`,
+        args,
         trimmed.slice(0, 200),
       );
     }
   }
 
   /**
-   * 挂载或覆盖一条路径。
+   * 挂载或覆盖一条路径（节点级或 Service 级）。
    *
    * 参数顺序有要求：所有 flag 必须位于目标之前。
    * `--https=<port>` 是明确给出而不是依赖默认——serve 的每个 HTTPS 端口是一个
    * 独立的配置组，省略端口会落到 443 组，从而改错路由。
+   *
+   * `--service=svc:x` 也必须在端口 flag 之前（官方示例与 CLI 解析均如此）。
    */
-  async serveUpsert(servePort: number, path: string, proxyUrl: string): Promise<void> {
-    this.#logger.info('tailscale serve 挂载', { servePort, path, proxyUrl });
+  async serveUpsert(servePort: number, path: string, proxyUrl: string, service?: string | null): Promise<void> {
+    this.#logger.info('tailscale serve 挂载', { service: service ?? null, servePort, path, proxyUrl });
     await this.#runOrThrow([
       'serve',
       '--bg',
       '--yes',
+      ...(service ? [`--service=${service}`] : []),
       `--https=${servePort}`,
       `--set-path=${path}`,
       proxyUrl,
@@ -155,8 +189,26 @@ export class TailscaleCli {
   }
 
   /** 摘除指定端口上的一条路径；不影响该端口或其它端口上的其它路径。 */
-  async serveRemove(servePort: number, path: string): Promise<void> {
-    this.#logger.info('tailscale serve 摘除', { servePort, path });
-    await this.#runOrThrow(['serve', '--yes', `--https=${servePort}`, `--set-path=${path}`, 'off']);
+  async serveRemove(servePort: number, path: string, service?: string | null): Promise<void> {
+    this.#logger.info('tailscale serve 摘除', { service: service ?? null, servePort, path });
+    await this.#runOrThrow([
+      'serve',
+      '--yes',
+      ...(service ? [`--service=${service}`] : []),
+      `--https=${servePort}`,
+      `--set-path=${path}`,
+      'off',
+    ]);
+  }
+
+  /**
+   * `tailscale serve clear svc:<name>`：摘除该 Service 在本节点上的**全部**端点配置。
+   *
+   * 只在删除「最后一条属于该 Service 的映射」且打开自动清理时使用；
+   * 注意它同时会停止 advertise，且该命令**不支持** `--yes`（没有交互确认）。
+   */
+  async serveClear(service: string): Promise<void> {
+    this.#logger.info('tailscale serve 清除 Service 配置', { service });
+    await this.#runOrThrow(['serve', 'clear', service]);
   }
 }

@@ -35,10 +35,10 @@ describe('MappingService.create', () => {
     expect(mapping.path).toBe('/worldforge');
     expect(mapping.servePort).toBe(443);
     expect(mapping.status).toBe('active');
-    expect(apply.upserted).toEqual([{ servePort: 443, path: '/worldforge' }]);
+    expect(apply.upserted).toEqual([{ service: null, servePort: 443, path: '/worldforge' }]);
     expect(apply.inSync).toBe(true);
     expect(gateway.proxyOf('/worldforge')).toBe('http://127.0.0.1:4173');
-    expect((await store.read())[0]!.ownedRoutes).toEqual([{ servePort: 443, path: '/worldforge' }]);
+    expect((await store.read())[0]!.ownedRoutes).toEqual([{ service: null, servePort: 443, path: '/worldforge' }]);
   });
 
   it('自动按宿主机端口关联容器', async () => {
@@ -101,7 +101,7 @@ describe('MappingService.create', () => {
 
     gateway.failUpsert.clear();
     const retry = await service.apply();
-    expect(retry.upserted).toEqual([{ servePort: 443, path: '/wf' }]);
+    expect(retry.upserted).toEqual([{ service: null, servePort: 443, path: '/wf' }]);
     expect((await service.overview()).mappings[0]!.status).toBe('active');
   });
 });
@@ -152,7 +152,7 @@ describe('MappingService 多端口', () => {
     expect(gateway.has('/home', 8443)).toBe(true);
 
     const removed = await service.remove(mapping.id);
-    expect(removed.apply.removed).toEqual([{ servePort: 8443, path: '/home' }]);
+    expect(removed.apply.removed).toEqual([{ service: null, servePort: 8443, path: '/home' }]);
     expect(gateway.has('/home', 8443)).toBe(false);
   });
 
@@ -215,11 +215,13 @@ describe('MappingService 状态变更', () => {
     await service.setEnabled(mapping.id, false);
     expect(gateway.has('/wf')).toBe(true);
     expect((await service.overview()).mappings[0]!.status).toBe('disabled-drift');
-    expect((await service.overview()).mappings[0]!.ownedRoutes).toEqual([{ servePort: 443, path: '/wf' }]);
+    expect((await service.overview()).mappings[0]!.ownedRoutes).toEqual([
+      { service: null, servePort: 443, path: '/wf' },
+    ]);
 
     gateway.failRemove.clear();
     const res = await service.apply();
-    expect(res.removed).toEqual([{ servePort: 443, path: '/wf' }]);
+    expect(res.removed).toEqual([{ service: null, servePort: 443, path: '/wf' }]);
     expect(gateway.has('/wf')).toBe(false);
   });
 });
@@ -281,9 +283,9 @@ describe('MappingService.enforceExposureGuard', () => {
     const guard = await service.enforceExposureGuard();
 
     expect(guard.exposures).toEqual([
-      { servePort: 443, path: '/leak', proxy: `http://127.0.0.1:${ADMIN_PORT}` },
+      { service: null, servePort: 443, path: '/leak', proxy: `http://127.0.0.1:${ADMIN_PORT}` },
     ]);
-    expect(guard.removed).toEqual([{ servePort: 443, path: '/leak' }]);
+    expect(guard.removed).toEqual([{ service: null, servePort: 443, path: '/leak' }]);
     expect(gateway.has('/leak')).toBe(false);
     expect(gateway.proxyOf('/ok')).toBe('http://127.0.0.1:3081');
 
@@ -299,9 +301,9 @@ describe('MappingService.enforceExposureGuard', () => {
     const guard = await service.enforceExposureGuard();
 
     expect(guard.exposures).toEqual([
-      { servePort: 8443, path: '/leak', proxy: `http://127.0.0.1:${ADMIN_PORT}` },
+      { service: null, servePort: 8443, path: '/leak', proxy: `http://127.0.0.1:${ADMIN_PORT}` },
     ]);
-    expect(guard.removed).toEqual([{ servePort: 8443, path: '/leak' }]);
+    expect(guard.removed).toEqual([{ service: null, servePort: 8443, path: '/leak' }]);
     expect(gateway.has('/leak', 8443)).toBe(false);
     // 443 上的正常路由不受影响。
     expect(gateway.proxyOf('/ok')).toBe('http://127.0.0.1:3081');
@@ -323,7 +325,7 @@ describe('MappingService 快照发布', () => {
     await service.create({ path: '/wf', hostPort: 4173 });
 
     const afterCreate = snapshot.last!;
-    expect(afterCreate.schemaVersion).toBe(1);
+    expect(afterCreate.schemaVersion).toBe(2);
     expect(afterCreate.routes.map((r) => r.path)).toEqual(['/external', '/wf']);
     const wf = afterCreate.routes.find((r) => r.path === '/wf')!;
     expect(wf).toMatchObject({ managed: true, status: 'active', proxy: 'http://127.0.0.1:4173' });
@@ -398,7 +400,17 @@ describe('MappingService.overview', () => {
 
     const overview = await service.overview();
     expect(overview.externalRoutes).toEqual([
-      { servePort: 443, path: '/', proxy: 'http://127.0.0.1:3081', hostPort: 3081, kind: 'proxy' },
+      {
+        service: null,
+        servePort: 443,
+        path: '/',
+        proxy: 'http://127.0.0.1:3081',
+        hostPort: 3081,
+        host: '127.0.0.1',
+        kind: 'proxy',
+        fromServiceConfig: false,
+        serviceInfo: null,
+      },
     ]);
     expect(overview.mappings[0]).toMatchObject({ servePort: 8443, status: 'active' });
   });

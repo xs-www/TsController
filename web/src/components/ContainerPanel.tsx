@@ -1,9 +1,18 @@
 /** 容器面板：列出容器与已发布端口，可就地建立映射。 */
-import { useEffect, useState, type JSX } from 'react';
+import { useEffect, useId, useState, type JSX } from 'react';
 import { ERROR_CODE_LABEL } from '../api';
-import type { ContainerInfo, ContainerPort, MappingInput, MappingMutationResponse } from '../api';
+import type { ContainerInfo, ContainerPort, MappingInput, MappingMutationResponse, ServiceInfo } from '../api';
 import type { ApiResult } from './MappingPanel';
-import { defaultPathFor, formatRouteLabel, formatTimestamp, isWildcardHost, normalizePathInput } from '../utils';
+import {
+  defaultPathFor,
+  formatRouteLabel,
+  formatTarget,
+  formatTimestamp,
+  isWildcardHost,
+  normalizePathInput,
+  normalizeServiceInput,
+  serviceShortName,
+} from '../utils';
 
 /** 统一的「创建映射」结果反馈，由 App 负责真正发请求。 */
 export type CreateMappingResult = ApiResult<MappingMutationResponse>;
@@ -18,6 +27,10 @@ export interface ContainerPanelProps {
   adminPort: number;
   /** 新建映射时预填的对外 HTTPS 端口。 */
   defaultServePort: number;
+  /** 当前节点上的 Tailscale Service，用于快速选择。 */
+  services: ServiceInfo[];
+  /** 本节点是否具备充当 Service host 的身份前提（无 tag 时为 false）。 */
+  canHostService: boolean;
   busy: boolean;
   createMapping: CreateMappingFn;
   onNotify: (level: 'info' | 'success' | 'warn' | 'error', title: string, message?: string) => void;
@@ -26,25 +39,35 @@ export interface ContainerPanelProps {
 /** 端口监听全部网卡时的黄色警示文案。 */
 const WILDCARD_WARNING = '该端口监听全部网卡，tailnet 内设备可绕过本工具直连 100.x 地址';
 
+/** 本节点是用户账号身份（无 tag）时的说明：Service 模式在当前节点上不可能成立。 */
+const NO_TAG_WARNING =
+  '本节点是用户账号身份（无 tag），不可能充当 Service host；请在已打 tag 的常开设备（例如 NAS）上运行 TsController，或在 Tailscale 管理后台给本机打 tag 后重新登录。';
+
 interface InlineFormProps {
   container: ContainerInfo;
   port: ContainerPort;
   defaultServePort: number;
+  services: ServiceInfo[];
+  canHostService: boolean;
   busy: boolean;
   onCancel: () => void;
   createMapping: CreateMappingFn;
-  onCreated: (mapping: { servePort: number; path: string }) => void;
+  onCreated: (mapping: { servePort: number; path: string; service: string | null }) => void;
 }
 
 function ContainerMappingForm({
   container,
   port,
   defaultServePort,
+  services,
+  canHostService,
   busy,
   onCancel,
   createMapping,
   onCreated,
 }: InlineFormProps): JSX.Element {
+  const [service, setService] = useState<string>('');
+  const [remoteHost, setRemoteHost] = useState<string>('');
   const [path, setPath] = useState<string>(defaultPathFor(container.name));
   const [hostPort, setHostPort] = useState<string>(String(port.hostPort));
   const [servePort, setServePort] = useState<string>(String(defaultServePort));
@@ -53,8 +76,11 @@ function ContainerMappingForm({
   const [pendingTakeover, setPendingTakeover] = useState<string | null>(null);
   const [submitBusy, setSubmitBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const serviceListId = useId();
 
   useEffect(() => {
+    setService('');
+    setRemoteHost('');
     setPath(defaultPathFor(container.name));
     setHostPort(String(port.hostPort));
     setServePort(String(defaultServePort));
@@ -64,10 +90,16 @@ function ContainerMappingForm({
     setError(null);
   }, [container.id, container.name, port.hostPort, port.containerPort, defaultServePort]);
 
+  /** 归一化后的 Service 名；空串 = 节点级路由。 */
+  const normalizedService = normalizeServiceInput(service);
+  /** 归一化后的远端主机；空串 = 本机回环。 */
+  const trimmedRemoteHost = remoteHost.trim();
+  const serviceMode = normalizedService !== '';
+
   const submit = async (confirmTakeover: boolean): Promise<void> => {
     const parsedPort = Number(hostPort);
     if (!Number.isInteger(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
-      setError('本机端口必须是 1-65535 的整数');
+      setError('目标端口必须是 1-65535 的整数');
       return;
     }
     const parsedServePort = Number(servePort);
@@ -89,6 +121,9 @@ function ContainerMappingForm({
         servePort: parsedServePort,
         targetPath,
         note,
+        // 空串一律作为「节点级」显式下发，避免 PATCH 语义下沿用旧 Service。
+        service: normalizedService === '' ? null : normalizedService,
+        ...(serviceMode && trimmedRemoteHost !== '' ? { remoteHost: trimmedRemoteHost } : {}),
         kind: 'container',
         containerId: container.id,
         containerName: container.name,
@@ -98,7 +133,7 @@ function ContainerMappingForm({
       const mapping = result.data?.mapping;
       if (mapping !== undefined) {
         setPendingTakeover(null);
-        onCreated({ servePort: mapping.servePort, path: mapping.path });
+        onCreated({ servePort: mapping.servePort, path: mapping.path, service: mapping.service });
         return;
       }
       if (result.code === 'takeover-required') {
@@ -119,10 +154,39 @@ function ContainerMappingForm({
   };
 
   const disabled = busy || submitBusy;
+  /** 预览里的目标地址，与服务端 desiredProxy 的拼法一致。 */
+  const previewTarget = formatTarget({
+    kind: 'container',
+    hostPort: Number.isInteger(Number(hostPort)) ? Number(hostPort) : port.hostPort,
+    targetPath,
+    ...(serviceMode && trimmedRemoteHost !== '' ? { remoteHost: trimmedRemoteHost } : {}),
+  });
 
   return (
     <div className="inline-form">
       <div className="inline-form-grid">
+        <label className="field">
+          <span>Tailscale Service（可选）</span>
+          <input
+            className="input mono"
+            value={service}
+            placeholder="留空 = 节点级路由；填 dsh 或 svc:dsh"
+            list={services.length > 0 ? serviceListId : undefined}
+            onChange={(e) => {
+              setService(e.target.value);
+            }}
+          />
+          {services.length > 0 ? (
+            <datalist id={serviceListId}>
+              {services.map((s) => (
+                <option key={s.name} value={s.name}>
+                  {s.dnsName ?? serviceShortName(s.name)}
+                  {s.advertised ? '' : '（等待审批）'}
+                </option>
+              ))}
+            </datalist>
+          ) : null}
+        </label>
         <label className="field">
           <span>路径</span>
           <input
@@ -147,12 +211,30 @@ function ContainerMappingForm({
             }}
           />
         </label>
+        {serviceMode ? (
+          <label className="field">
+            <span>代理目标主机</span>
+            <input
+              className="input mono"
+              value={remoteHost}
+              placeholder="留空 = 本机 127.0.0.1；Service host 可代理远端主机"
+              onChange={(e) => {
+                setRemoteHost(e.target.value);
+              }}
+            />
+          </label>
+        ) : null}
         <label className="field">
-          <span>本机端口</span>
+          <span>{serviceMode ? '目标主机端口' : '本机端口'}</span>
           <input
             className="input mono"
             inputMode="numeric"
             value={hostPort}
+            title={
+              serviceMode
+                ? '该端口属于上面那台「代理目标主机」，不是本机'
+                : '本机（127.0.0.1）上被代理的端口'
+            }
             onChange={(e) => {
               setHostPort(e.target.value);
             }}
@@ -182,15 +264,26 @@ function ContainerMappingForm({
         </label>
       </div>
 
+      {!canHostService ? (
+        <p className="warn-inline" role="note">
+          <span className="badge badge-warn">注意</span>
+          {NO_TAG_WARNING}
+        </p>
+      ) : null}
+
       <p className="inline-form-hint">
         将把{' '}
         <code className="mono">
-          {servePort === '443' ? 'https://<tailnet>' : `https://<tailnet>:${servePort}`}
+          {serviceMode
+            ? `https://${serviceShortName(normalizedService)}.<tailnet>`
+            : servePort === '443'
+              ? 'https://<tailnet>'
+              : `https://<tailnet>:${servePort}`}
           {normalizePathInput(path) || '/…'}
         </code>{' '}
         反向代理到{' '}
         <code className="mono">
-          127.0.0.1:{hostPort}
+          {previewTarget}
           {targetPath === '' ? '' : targetPath}
         </code>
         ，目标容器 <strong>{container.name}</strong> 的 {String(port.containerPort)}/{port.protocol}。
@@ -201,11 +294,20 @@ function ContainerMappingForm({
         <code className="mono">/api/agent/events</code> ⟹ 请求 <code className="mono">/api/addSchedule</code> 到达后端
         <code className="mono">/api/agent/events</code>。
       </p>
+      {serviceMode ? (
+        <p className="inline-form-hint muted small">
+          Service 级路由写进的是 <code className="mono">{normalizedService}</code> 的 serve 配置，
+          与节点级路由互不干扰；「目标主机端口」属于上面那台<strong>代理目标主机</strong>。当前节点还必须
+          被管理员承认为该 Service 的 host（Services → 该 Service → Service hosts → Approve），
+          否则状态是「等待审批」，对外暂时不通。
+        </p>
+      ) : null}
 
       {pendingTakeover !== null ? (
         <div className="inline-confirm" role="alert">
           <p>
-            路径 <code className="mono">{normalizePathInput(path)}</code> 当前被一条未托管的 serve 路由占用：
+            路径 <code className="mono">{formatRouteLabel(Number(servePort) || 443, normalizePathInput(path), serviceMode ? normalizedService : null)}</code>{' '}
+            当前被一条未托管的 serve 路由占用：
             {pendingTakeover}
           </p>
           <p className="muted">接管后该路径将由 TsController 管理，原 handler 会被覆盖。</p>
@@ -260,6 +362,8 @@ export function ContainerPanel({
   loading,
   adminPort,
   defaultServePort,
+  services,
+  canHostService,
   busy,
   createMapping,
   onNotify,
@@ -377,6 +481,8 @@ export function ContainerPanel({
                                     container={c}
                                     port={p}
                                     defaultServePort={defaultServePort}
+                                    services={services}
+                                    canHostService={canHostService}
                                     busy={busy}
                                     createMapping={createMapping}
                                     onCancel={() => {
@@ -387,7 +493,7 @@ export function ContainerPanel({
                                       onNotify(
                                         'success',
                                         '映射已创建',
-                                        `${formatRouteLabel(created.servePort, created.path)} 已指向 ${p.hostIp}:${String(p.hostPort)}`,
+                                        `${formatRouteLabel(created.servePort, created.path, created.service)} 已指向 ${p.hostIp}:${String(p.hostPort)}`,
                                       );
                                     }}
                                   />

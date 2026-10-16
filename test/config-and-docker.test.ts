@@ -194,8 +194,8 @@ describe('reviveMapping', () => {
       443,
     )!;
     expect(m.ownedRoutes).toEqual([
-      { servePort: 8443, path: '/home' },
-      { servePort: 8443, path: '/old' },
+      { service: null, servePort: 8443, path: '/home' },
+      { service: null, servePort: 8443, path: '/old' },
     ]);
   });
 
@@ -216,12 +216,12 @@ describe('reviveMapping', () => {
       443,
     )!;
     expect(m.ownedRoutes).toEqual([
-      { servePort: 8443, path: '/home' },
+      { service: null, servePort: 8443, path: '/home' },
       // 端口非法 → 回落到默认端口而不是丢弃路径
-      { servePort: 443, path: '/bad-port' },
+      { service: null, servePort: 443, path: '/bad-port' },
       // 路径非法 → 丢弃
       // 与第一条同端口不同路径，保留
-      { servePort: 443, path: '/home' },
+      { service: null, servePort: 443, path: '/home' },
     ]);
   });
 });

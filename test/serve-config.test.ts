@@ -53,7 +53,7 @@ describe('parseServeStatus', () => {
   });
 
   it('无配置时返回空快照而不是报错', () => {
-    expect(parseServeStatus({})).toEqual({ httpsPorts: [], hostname: null, routes: [] });
+    expect(parseServeStatus({})).toEqual({ httpsPorts: [], hostname: null, routes: [], services: [] });
     expect(parseServeStatus(null).routes).toEqual([]);
   });
 

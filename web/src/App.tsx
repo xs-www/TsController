@@ -20,13 +20,15 @@ import type {
   MappingsResponse,
   MappingMutationResponse,
   RouteRef,
+  ServeRoutesResponse,
   ServeRouteView,
   SystemInfo,
 } from './api';
-import { formatRouteLabel } from './utils';
+import { formatRouteLabel, formatScopedLabel } from './utils';
 import { SecurityBanner } from './components/SecurityBanner';
 import { TopBar } from './components/TopBar';
 import { Toolbar } from './components/Toolbar';
+import { ServicePanel } from './components/ServicePanel';
 import { ContainerPanel } from './components/ContainerPanel';
 import { MappingPanel } from './components/MappingPanel';
 import type { ApiResult } from './components/MappingPanel';
@@ -46,7 +48,7 @@ interface Payload {
   system: SystemInfo;
   containers: { containers: ContainerInfo[]; source: string };
   mappings: MappingsResponse;
-  serve: { serveHost: string | null; httpsPorts: number[]; routes: ServeRouteView[] };
+  serve: ServeRoutesResponse;
   audit: { events: AuditEvent[] };
 }
 
@@ -133,11 +135,17 @@ export function App(): JSX.Element {
   const reportApply = useCallback(
     (apply: ApplyResult, options?: { successTitle?: string; failureTitle?: string }): void => {
       const details: ToastDetailItem[] = [];
-      for (const r of apply.upserted) details.push({ text: `已挂载 ${formatRouteLabel(r.servePort, r.path)}`, kind: 'ok' });
-      for (const r of apply.removed) details.push({ text: `已摘除 ${formatRouteLabel(r.servePort, r.path)}`, kind: 'ok' });
-      for (const b of apply.blocked) details.push({ text: `被阻止 ${b.path}：${b.reason}`, kind: 'bad' });
+      for (const r of apply.upserted)
+        details.push({ text: `已挂载 ${formatRouteLabel(r.servePort, r.path, r.service)}`, kind: 'ok' });
+      for (const r of apply.removed)
+        details.push({ text: `已摘除 ${formatRouteLabel(r.servePort, r.path, r.service)}`, kind: 'ok' });
+      for (const b of apply.blocked)
+        details.push({ text: `被阻止 ${formatScopedLabel(b.service, b.path)}：${b.reason}`, kind: 'bad' });
       for (const e of apply.exposures)
-        details.push({ text: `管理端口暴露 ${formatRouteLabel(e.servePort, e.path)} → ${e.proxy}`, kind: 'bad' });
+        details.push({
+          text: `管理端口暴露 ${formatRouteLabel(e.servePort, e.path, e.service)} → ${e.proxy}`,
+          kind: 'bad',
+        });
       for (const e of apply.errors) details.push({ text: `错误：${e}`, kind: 'bad' });
 
       const bad = apply.errors.length > 0 || apply.blocked.length > 0 || apply.exposures.length > 0;
@@ -306,8 +314,9 @@ export function App(): JSX.Element {
   const managedKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const m of mappings?.mappings ?? []) {
-      for (const r of [...m.ownedRoutes, { servePort: m.servePort, path: m.path }]) {
-        keys.add(`${r.servePort}|${r.path.toLowerCase()}`);
+      const owned = [...m.ownedRoutes, { service: m.service, servePort: m.servePort, path: m.path }];
+      for (const r of owned) {
+        keys.add(`${r.service ?? '-'}|${r.servePort}|${r.path.toLowerCase()}`);
       }
     }
     return keys;
@@ -326,6 +335,10 @@ export function App(): JSX.Element {
 
   const adminPort = system?.adminPort ?? ADMIN_PORT_FALLBACK;
   const planSummary = mappings?.planSummary ?? system?.plan ?? null;
+  const counts = mappings?.counts ?? system?.counts ?? null;
+  // Service 状态以映射接口为准（它总是和 counts 一起刷新），system 作为兜底。
+  const services = mappings?.services ?? system?.services ?? [];
+  const selfTags = mappings?.selfTags ?? system?.selfTags ?? [];
   const showSkeleton = !loadedOnce && system === null;
 
   return (
@@ -335,6 +348,7 @@ export function App(): JSX.Element {
       <main className="main">
         <Toolbar
           plan={planSummary}
+          counts={counts}
           loading={busy}
           applying={syncing}
           adminUrl={system?.adminUrl ?? null}
@@ -346,11 +360,21 @@ export function App(): JSX.Element {
 
         {showSkeleton ? <p className="empty">正在读取系统状态…</p> : null}
 
+        <ServicePanel
+          services={services}
+          selfTags={selfTags}
+          canHostService={system?.canHostService ?? false}
+          loading={busy}
+          onCopied={handleCopied}
+        />
+
         <ContainerPanel
           containers={containers}
           loading={busy}
           adminPort={adminPort}
           defaultServePort={system?.servePort ?? 443}
+          services={services}
+          canHostService={system?.canHostService ?? false}
           busy={busy}
           createMapping={createMapping}
           onNotify={notify}
@@ -358,11 +382,11 @@ export function App(): JSX.Element {
 
         <MappingPanel
           mappings={mappings?.mappings ?? []}
-          counts={mappings?.counts ?? null}
+          counts={counts}
           planSummary={planSummary}
           loading={busy}
           adminPort={adminPort}
-          serveHost={system?.serveHost ?? null}
+          services={services}
           busy={busy}
           updateMapping={updateMapping}
           deleteMapping={deleteMapping}
@@ -381,10 +405,11 @@ export function App(): JSX.Element {
 
         <section className="panel">
           <header className="panel-head">
-            <h2>serve 路由（只读）</h2>
+            <h2>serve 路由（只读，含 Service 级）</h2>
             <span className="panel-meta">
-              {system?.serveHost ?? '无 Web 服务'}
-              {system && system.servePorts.length > 0 ? ` · HTTPS ${system.servePorts.join(', ')}` : ''} · 共{' '}
+              {system?.serveHost ?? '无节点级 Web 服务'}
+              {system && system.servePorts.length > 0 ? ` · HTTPS ${system.servePorts.join(', ')}` : ''}
+              {services.length > 0 ? ` · Service ${String(services.length)} 个` : ''} · 共{' '}
               {String(serveRows.length)} 条
             </span>
           </header>
@@ -394,18 +419,28 @@ export function App(): JSX.Element {
             <table className="simple-table">
               <thead>
                 <tr>
+                  <th>Service</th>
                   <th>端口</th>
                   <th>路径</th>
+                  <th>主机名</th>
                   <th>handler</th>
-                  <th>宿主端口</th>
+                  <th>目标端口</th>
                   <th>归属</th>
                 </tr>
               </thead>
               <tbody>
                 {serveRows.map((r) => (
-                  <tr key={`${r.route.servePort}|${r.route.path}`}>
+                  <tr key={`${r.route.service ?? '-'}|${String(r.route.servePort)}|${r.route.path}`}>
+                    <td>
+                      {r.route.service === null ? (
+                        <span className="pill pill-grey">节点级</span>
+                      ) : (
+                        <span className="pill pill-blue">{r.route.service}</span>
+                      )}
+                    </td>
                     <td className="mono">{String(r.route.servePort)}</td>
                     <td className="mono">{r.route.path}</td>
+                    <td className="mono small">{r.route.host}</td>
                     <td className="mono small">{r.proxy ?? r.kind}</td>
                     <td className="mono">{r.hostPort === null ? '—' : String(r.hostPort)}</td>
                     <td>

@@ -54,7 +54,7 @@ export async function createRuntime(overrides: RuntimeOverrides = {}): Promise<R
 
   const runner = overrides.commandRunner ?? new ExecFileRunner();
   const cli = new TailscaleCli(config.tailscaleBin, runner, logger.child('tailscale'));
-  const gateway = overrides.gateway ?? new TailscaleServeGateway(cli);
+  const gateway = overrides.gateway ?? new TailscaleServeGateway(cli, logger.child('tailscale'));
 
   const store = overrides.store ?? new FileMappingStore(config.dataDir, logger.child('store'), config.servePort);
   const audit = overrides.audit ?? new FileAuditLog(config.dataDir, logger.child('audit'));

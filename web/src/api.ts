@@ -16,14 +16,17 @@ export type MappingStatus =
   | 'disabled-drift'
   | 'orphaned-target'
   | 'blocked'
-  | 'conflict';
+  | 'conflict'
+  | 'awaiting-approval';
 
 export type TargetKind = 'container' | 'host';
 
 export type MappingCounts = Record<MappingStatus, number>;
 
-/** 指向 serve 中某个具体路由位置（端口 + 路径）。 */
+/** 指向 serve 中某个具体路由位置（Service + 端口 + 路径）。 */
 export interface RouteRef {
+  /** 所属 Service，形如 "svc:dsh"；null = 节点级路由。 */
+  service: string | null;
   servePort: number;
   path: string;
 }
@@ -37,6 +40,8 @@ export interface PlanSummary {
 }
 
 export interface Exposure {
+  /** 所属 Service，形如 "svc:dsh"；null = 节点级路由。 */
+  service: string | null;
   servePort: number;
   path: string;
   proxy: string;
@@ -44,10 +49,13 @@ export interface Exposure {
 
 export interface MappingTarget {
   kind: TargetKind;
-  /** 本机端口。 */
+  /** 代理目标端口：`remoteHost` 省略时它是本机端口。 */
   hostPort: number;
   /** "" 或 "/api/agent"。 */
   targetPath: string;
+  /** 代理目标主机；省略即本机回环 127.0.0.1。只在 Service 级路由上支持。 */
+  remoteHost?: string;
+  scheme?: 'http' | 'https';
   containerId?: string;
   containerName?: string;
   containerPort?: number;
@@ -55,6 +63,8 @@ export interface MappingTarget {
 
 export interface MappingView {
   id: string;
+  /** 关联的 Tailscale Service，例如 "svc:dsh"；null = 节点级路由。 */
+  service: string | null;
   /** "/worldforge" */
   path: string;
   /** 对外 HTTPS 端口；443 以外的端口必须体现在链接里。 */
@@ -62,7 +72,7 @@ export interface MappingView {
   target: MappingTarget;
   note: string;
   enabled: boolean;
-  /** 该映射当前在 serve 中占用的全部位置（端口 + 路径）。 */
+  /** 该映射当前在 serve 中占用的全部位置（Service + 端口 + 路径）。 */
   ownedRoutes: RouteRef[];
   /** ISO 时间字符串。 */
   createdAt: string;
@@ -73,8 +83,24 @@ export interface MappingView {
   desiredProxy: string;
   /** serve 中当前实际地址，null 表示该位置未被占用。 */
   actualProxy: string | null;
+  /** 该映射对外的完整基址（不含路径）；无法确定主机名时为 null。 */
+  baseUrl: string | null;
   /** 状态的中文说明，可能为 null。 */
   detail: string | null;
+}
+
+/** 一个 Tailscale Service 在当前节点上的状态。 */
+export interface ServiceInfo {
+  /** 形如 "svc:dsh"。 */
+  name: string;
+  /** MagicDNS 名（不含端口），例如 "dsh.example-tailnet.ts.net"；未知为 null。 */
+  dnsName: string | null;
+  /** 本节点为该 Service 配置的全部对外端口，升序。 */
+  servePorts: number[];
+  /** 本节点是否已被承认为该 Service 的 host（即广告已被批准/已 advertise）。 */
+  advertised: boolean;
+  /** Service 的 TailVIP；未知为空数组。 */
+  vipIps: string[];
 }
 
 export interface ContainerPort {
@@ -101,11 +127,23 @@ export interface ContainerInfo {
 }
 
 export interface ExternalRoute {
+  /** 所属 Service，形如 "svc:dsh"；null = 节点级路由。 */
+  service: string | null;
   servePort: number;
   path: string;
   proxy: string | null;
   hostPort: number | null;
+  /** 代理目标主机（"127.0.0.1" 或远端主机名）。 */
+  host: string | null;
   kind: string;
+  /**
+   * true = 该路由是从 Tailscale Service 配置读出的。
+   *
+   * 读出的 handler 树是有损的：只有根路径、目标路径不可恢复。
+   */
+  fromServiceConfig: boolean;
+  /** Service 级路由对应的 Service 状态；非 Service 路由为 null。 */
+  serviceInfo: ServiceInfo | null;
 }
 
 export interface SystemSecurity {
@@ -127,11 +165,17 @@ export interface SystemInfo {
   /** 例如 "https://my-laptop.example-tailnet.ts.net"。 */
   baseUrl: string | null;
   dnsName: string | null;
+  /** MagicDNS 后缀，例如 "example-tailnet.ts.net"；Service 的对外名字由它拼出。 */
+  magicDnsSuffix: string | null;
   tailnetIps: string[];
   hostname: string | null;
   /** 例如 "Running"。 */
   backendState: string | null;
   tailscaleVersion: string | null;
+  /** 本节点的 tag（空数组 = 本节点不可能充当 Service host）。 */
+  selfTags: string[];
+  /** 本节点是否具备充当 Service host 的身份前提（selfTags.length > 0）。 */
+  canHostService: boolean;
   /** 管理界面地址，例如 "http://127.0.0.1:8787"。 */
   adminUrl: string;
   /** 管理界面端口。 */
@@ -140,8 +184,10 @@ export interface SystemInfo {
   servePort: number;
   /** serve 中已声明的全部 HTTPS 端口，升序。 */
   servePorts: number[];
-  /** serve 主机名（不含端口），例如 "my-laptop.example-tailnet.ts.net"。 */
+  /** 节点级 serve 主机名（不含端口），例如 "my-laptop.example-tailnet.ts.net"。 */
   serveHost: string | null;
+  /** 当前节点上的 Tailscale Service 及状态。 */
+  services: ServiceInfo[];
   sources: SystemSources;
   security: SystemSecurity;
   plan: PlanSummary;
@@ -156,16 +202,20 @@ export interface ContainersResponse {
 export interface MappingsResponse {
   mappings: MappingView[];
   externalRoutes: ExternalRoute[];
+  /** 当前节点上的 Tailscale Service 及状态。 */
+  services: ServiceInfo[];
+  /** 当前节点的 tag；为空即本节点不可能充当 Service host。 */
+  selfTags: string[];
   planSummary: PlanSummary;
   counts: MappingCounts;
 }
 
 export interface ApplyResult {
-  /** 本次实际挂载的路由位置（端口 + 路径）。 */
+  /** 本次实际挂载的路由位置（Service + 端口 + 路径）。 */
   upserted: RouteRef[];
   /** 本次实际摘除的路由位置。 */
   removed: RouteRef[];
-  blocked: Array<{ mappingId: string; path: string; reason: string }>;
+  blocked: Array<{ mappingId: string; service: string | null; path: string; reason: string }>;
   exposures: Exposure[];
   errors: string[];
   inSync: boolean;
@@ -183,15 +233,19 @@ export interface MappingDeleteResponse {
 
 export interface ImportResponse {
   imported: MappingView[];
-  skipped: Array<{ servePort: number; path: string; reason: string }>;
+  skipped: Array<{ service: string | null; servePort: number; path: string; reason: string }>;
 }
 
 export interface ProxyHandler {
   kind: 'proxy';
   raw: string;
   hostPort: number | null;
+  /** 代理目标主机（不含端口）。 */
+  host: string | null;
   targetPath: string;
   loopback: boolean;
+  /** 是否由 Service 配置的 endpoint 语法解析而来（此时 handler 树是有损的）。 */
+  fromServiceConfig?: boolean;
 }
 
 export interface OtherHandler {
@@ -200,6 +254,8 @@ export interface OtherHandler {
 }
 
 export interface ServeRouteView {
+  /** 所属 Service；null = 节点级。 */
+  service: string | null;
   servePort: number;
   host: string;
   path: string;
@@ -213,6 +269,8 @@ export interface ServeRoutesResponse {
   serveHost: string | null;
   /** serve 中已声明的全部 HTTPS 端口，升序。 */
   httpsPorts: number[];
+  /** 当前节点上的 Tailscale Service 及状态。 */
+  services: ServiceInfo[];
   routes: ServeRouteView[];
 }
 
@@ -234,6 +292,11 @@ export interface MappingInput {
   /** 对外 HTTPS 端口；省略即由后端用默认端口。 */
   servePort?: number;
   targetPath?: string;
+  /** 接受 "dsh" 或 "svc:dsh"；null / "" = 节点级路由。字段省略 = 不改动（PATCH 语义）。 */
+  service?: string | null;
+  /** 代理目标主机；省略即本机。后端只在 Service 级路由上接受它。 */
+  remoteHost?: string | null;
+  scheme?: 'http' | 'https';
   kind?: TargetKind;
   containerId?: string;
   containerName?: string;
@@ -258,6 +321,10 @@ export const KNOWN_ERROR_CODES = [
   'invalid-port',
   'invalid-serve-port',
   'invalid-target-path',
+  'invalid-service',
+  'invalid-remote-host',
+  'remote-host-requires-service',
+  'invalid-scheme',
   'not-found',
 ] as const;
 
@@ -273,6 +340,10 @@ export const ERROR_CODE_LABEL: Record<string, string> = {
   'invalid-port': '端口非法',
   'invalid-serve-port': '对外端口非法',
   'invalid-target-path': '目标路径非法',
+  'invalid-service': 'Service 名非法',
+  'invalid-remote-host': '代理目标主机非法',
+  'remote-host-requires-service': '远端目标只支持 Service 级路由',
+  'invalid-scheme': '代理协议非法',
   'not-found': '目标不存在',
   'bad-host': '请求来源非法',
   'forbidden-host': '只接受来自本机的请求',
