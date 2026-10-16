@@ -1,0 +1,30 @@
+# 构建上下文排除项。上下文是仓库根目录，见 deploy/Dockerfile。
+#
+# 目的：镜像里只保留运行所需的东西，避免把本机的 node_modules、构建产物、
+# 运行期数据与验证残留一起打进几十上百 MB 的层。
+
+# 依赖与构建产物：在镜像内重新安装/构建
+node_modules
+**/node_modules
+web/dist
+
+# 运行期数据：绝不能进镜像（映射库、审计日志、快照）
+data
+vol
+
+# 文档与仓库元数据
+docs
+.git
+.gitattributes
+.gitignore
+
+# 测试与验证脚本的产物（scripts/ 本身要保留，镜像里可手动跑 clean:verify）
+test
+
+# 开发期临时文件
+*.log
+.probe*
+.tmp-*
+*.tmp
+.env
+.env.*

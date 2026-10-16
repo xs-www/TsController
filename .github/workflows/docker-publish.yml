@@ -1,0 +1,90 @@
+name: Build and push image
+
+# 触发方式：
+#   1) 打 tag 推送（推荐）：git tag v0.1.0 && git push origin v0.1.0
+#   2) 手动触发：Actions 页面 → Run workflow
+#
+# 产物：ghcr.io/<owner>/<repo>，自动带上版本与 sha 标签。
+#
+# 首次运行后，镜像会出现在仓库的 Packages 里。默认是**私有**的，
+# NAS 上拉取需要 docker login；想公开就去 Package 设置里改可见性。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# GITHUB_TOKEN 需要 packages:write 才能推镜像。
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # 先跑测试与类型检查。推到 ghcr.io 的镜像应当是通过验证的，
+  # 否则 NAS 上拉到坏镜像的排查成本远高于这里多跑一分钟。
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (backend + web)
+        run: npm run lint
+
+      - name: Unit / API tests
+        run: npm test
+
+  build-and-push:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ghcr.io 的镜像路径**必须全小写**。GitHub 的仓库名/用户名可以含大写，
+      # 直接用 github.repository 会在 push 时报 invalid reference format。
+      # 这一步显式转小写，避免那个坑。
+      - name: Compute lowercase image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 绿联 DX4600 Pro 及其同代 NAS 基本是 Intel x86_64，因此只建 amd64。
+          # 若将来要跑在 ARM NAS 上，改成：platforms: linux/amd64,linux/arm64
+          # （注意：arm64 走 QEMU 模拟，npm ci 会明显变慢）
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

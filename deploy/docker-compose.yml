@@ -1,0 +1,95 @@
+# TsController · NAS 部署
+#
+# 用法（在仓库根目录）：
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# ⚠️ 未在真实 NAS 上验证过。上线前请先按 docs/nas-deployment.md §3 探路，
+#    并按查到的实际路径修改下面标注 <<< 需要确认 的地方。
+
+services:
+  tscontroller:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: tscontroller:local
+    container_name: tscontroller
+    restart: unless-stopped
+
+    # ────────────────────────────────────────────────────────────────
+    # 为什么必须 host 网络（不是优化项）
+    #
+    # 本应用硬性拒绝绑定非回环地址——没有绕过开关。若改用
+    #   ports: ["127.0.0.1:8787:8787"]
+    # 则容器内必须 bind 0.0.0.0 才能被 publish，会被拒绝并直接退出。
+    #
+    # network_mode: host 让容器里的 127.0.0.1 就是宿主的回环，
+    # 于是「只监听回环」这条安全约束既成立、又能通过启动检查，
+    # 同时管理界面仍然只从宿主本机可达（SSH 隧道或 NAS 本机浏览器）。
+    # ────────────────────────────────────────────────────────────────
+    network_mode: host
+
+    environment:
+      # 必设：否则默认锚定到容器内 /app/data（可写层），重建即丢库。
+      TSCONTROLLER_DATA_DIR: /data
+
+      # 留空即 /data/public。只有想把快照放到别处才取消注释。
+      # TSCONTROLLER_SNAPSHOT_DIR: /data/public
+
+      TSCONTROLLER_PORT: "8787"
+
+      # 容器内路径，对应下面 volumes 里的 tailscale 挂载。
+      TSCONTROLLER_TAILSCALE_BIN: /usr/local/bin/tailscale
+
+      # Unix socket 形式的 Docker 端点。
+      TSCONTROLLER_DOCKER_PIPE: unix:///var/run/docker.sock
+
+      # 新建映射时的默认对外 HTTPS 端口。
+      TSCONTROLLER_SERVE_PORT: "443"
+
+      # 快照刷新间隔；0 表示只在启动与每次收敛后写。
+      TSCONTROLLER_SNAPSHOT_INTERVAL_MS: "60000"
+
+      TSCONTROLLER_AUTO_UNEXPOSE: "true"
+
+      TSCONTROLLER_LOG_LEVEL: info
+      TZ: Asia/Shanghai
+
+    volumes:
+      # 数据卷：映射库、审计日志、以及给 HomePage 读的快照。
+      #
+      # 注意是 ../data 而不是 ./data：compose 里的相对路径是**相对 compose 文件
+      # 所在目录**解析的，写 ./data 会得到 deploy/data，与 docs/nas-deployment.md
+      # §2.3 的布局不符。
+      - ../data:/data
+
+      # 宿主 Docker（读容器清单/端口）。
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # 宿主 tailscaled 的 LocalAPI。Linux 上是 Unix socket，**可以**挂进容器
+      # （Windows 上是命名管道，做不到——所以这个方案只在 Linux/NAS 上成立）。
+      - /var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock
+
+      # <<< 需要确认：宿主 tailscale 可执行文件的真实路径。
+      #     先用 `which tailscale` 查；群晖套件版通常在
+      #     /var/packages/Tailscale/target/bin/tailscale
+      #
+      # ⚠️ 若这里写了一个不存在的路径，Docker 会**创建一个同名目录**，
+      #    容器内 /usr/local/bin/tailscale 就成了目录，调用必然失败。
+      #    挂载前先 ls -l 确认。
+      - /usr/bin/tailscale:/usr/local/bin/tailscale:ro
+
+    healthcheck:
+      # 只验证管理面活着；tailscale/docker 的可用性由界面与快照体现。
+      test: ["CMD", "node", "-e", "require('http').get({host:'127.0.0.1',port:process.env.TSCONTROLLER_PORT||8787,path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+# 说明：这里刻意**不**定义 HomePage 所需的挂载。HomePage 有自己的 compose，
+# 在那边加一行只读挂载即可：
+#
+#   volumes:
+#     - /volume1/docker/tscontroller/data/public:/tscontroller:ro
+#
+# 只挂 public/ 而不是整个 data/，这样门户拿不到 mappings.json 与 audit.jsonl。
