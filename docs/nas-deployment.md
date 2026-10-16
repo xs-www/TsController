@@ -119,10 +119,15 @@ tailscale status --json | grep -m1 DNSName
 
 ## 4. 第二步：部署 TsController
 
-> **先确认你手上的镜像从哪来。**
+> **镜像已经发布好了，不需要你自己构建。**
 >
-> - **已经推到 ghcr.io** → 跳过构建。compose 里把 `build:` 段换成 `image: ghcr.io/xs-www/tscontroller:<tag>`，然后直接看 §4.1。
-> - **还没推** → 见 [`image-publishing.md`](./image-publishing.md)。两个前提：一个带 `write:packages` 的 GitHub PAT，以及先在 NAS 上跑 `uname -m` 确认架构（这决定镜像要建 amd64 还是 arm64）。
+> ```bash
+> uname -m                                            # 必须是 x86_64
+> docker pull ghcr.io/xs-www/tscontroller:latest      # 包是公开的，无需登录
+> ```
+>
+> 当前状态：标签 `latest` / `sha-6d99f07`，平台 `linux/amd64`，已实测能从容器内读到宿主 Docker 并生成快照。
+> 重新发布或换版本见 [`image-publishing.md`](./image-publishing.md)。
 
 ```bash
 cd /volume1/docker
@@ -139,10 +144,10 @@ services:
     # build:
     #   context: ..
     #   dockerfile: deploy/Dockerfile
-    image: ghcr.io/xs-www/tscontroller:0.1.0
+    image: ghcr.io/xs-www/tscontroller:latest
 ```
 
-之后 `up -d` 不用带 `--build`。
+之后 `up -d` 不用带 `--build`。想锁定版本就用 `:sha-6d99f07` 代替 `:latest`，避免 `latest` 漂移。
 
 ### 4.1 先按 §3 的结果调整 `deploy/docker-compose.yml`
 

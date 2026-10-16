@@ -1,5 +1,19 @@
 # 打包镜像并推送到 ghcr.io
 
+> ## ✅ 当前已发布
+>
+> | 项 | 值 |
+> | --- | --- |
+> | 镜像 | `ghcr.io/xs-www/tscontroller` |
+> | 标签 | `latest`、`sha-6d99f07` |
+> | 可见性 | **公开** —— NAS 上拉取**不需要登录** |
+> | 平台 | `linux/amd64` |
+> | 来源 | commit `6d99f07`，由 Actions `workflow_dispatch` 构建（2026-10-16） |
+>
+> 已实测：从 ghcr 拉下来的镜像能正常运行 —— 读到宿主 7 个容器、生成 2 条路由的快照、写进挂载卷、按端口解析出容器关联（`/` → cs22-web、`/portal` → homepage-portal）。
+>
+> **NAS 上直接拉即可**，见 §4。下面 §0–§3 是「以后要重新构建 / 重新发布」时的流程。
+
 > ## 本仓库的具体值
 >
 > | 项 | 值 |
@@ -18,10 +32,13 @@
 
 | | 手动构建推送（§2） | GitHub Actions（§3） |
 | --- | --- | --- |
-| 前提 | 只需要一个 PAT | 仓库已在 GitHub 上（✅ 已建，当前为空仓库） |
+| 前提 | 只需要一个 PAT | 仓库已在 GitHub 上（✅ 已建） |
 | 何时用 | 立刻要一个镜像去 NAS 上跑 | 以后打 tag 自动出镜像 |
 
-仓库 `xs-www/TsController` 已经存在且是空的，两条路都能走。
+仓库 `xs-www/TsController` 已存在且有内容，两条路都能走。
+
+> **注意**：上面那次是 `workflow_dispatch` 触发的，所以**没有版本号标签**，只有 `latest` 与 `sha-xxxxxxx`。
+> 想要 `0.1.0` 这样的版本标签，需要推一个 `v0.1.0` 的 tag（见 §3.2）。
 
 ---
 
@@ -206,28 +223,49 @@ permissions:
 
 ## 4. 在 NAS 上拉取
 
-```bash
-# 私有包需要先登录（同一个 PAT，或另建一个只读的）
-echo "<PAT>" | docker login ghcr.io -u xs-www --password-stdin
+**当前这个包是公开的，所以不需要登录，两条命令就够：**
 
-docker pull ghcr.io/xs-www/tscontroller:0.1.0
+```bash
+# 1) 确认架构（必须是 x86_64，镜像只有 linux/amd64）
+uname -m
+
+# 2) 直接拉
+docker pull ghcr.io/xs-www/tscontroller:latest
 ```
 
-### 4.1 如果不想在 NAS 上配 PAT
+指定版本（避免 `latest` 漂移）：
 
-在 GitHub 上把包设为公开：
-**仓库 → Packages → tscontroller → Package settings → Change visibility → Public**
+```bash
+docker pull ghcr.io/xs-www/tscontroller:sha-6d99f07
+```
 
-私有包和公开包的拉取都不需要额外费用。**但这个镜像是内网工具，建议保持私有。**
+### 4.1 如果以后把包改成私有了
+
+那就需要先登录（PAT 勾 `read:packages`）：
+
+```bash
+echo "<PAT>" | docker login ghcr.io -u xs-www --password-stdin
+docker pull ghcr.io/xs-www/tscontroller:latest
+```
 
 ### 4.2 拉不到时的排查
 
 | 现象 | 原因 |
 | --- | --- |
-| `denied` / `unauthorized` | 没登录，或 PAT 缺 `read:packages` |
+| `denied` / `unauthorized` | 包是私有的但没登录，或 PAT 缺 `read:packages` |
 | `manifest unknown` | 标签名写错，或镜像还没推成功 |
 | `no matching manifest for linux/arm64` | 镜像只建了 amd64，NAS 是 arm64 → 按 §2.2 重建 |
 | `exec format error`（拉到了但起不来） | 同上，架构不匹配 |
+
+### 4.3 验证拉下来的镜像
+
+```bash
+docker image inspect ghcr.io/xs-www/tscontroller:latest --format '{{.Os}}/{{.Architecture}}'
+# 期望输出：linux/amd64
+
+docker run --rm --entrypoint node ghcr.io/xs-www/tscontroller:latest -v
+# 期望输出：v22.x（必须 >= 22.18）
+```
 
 ---
 
