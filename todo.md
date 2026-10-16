@@ -46,7 +46,13 @@
 - [x] `.github/workflows/docker-publish.yml`：tag 推送或手动触发；先跑 `lint` + `test` 再构建；显式把镜像名转小写（ghcr 要求全小写）。
 - [x] `docs/image-publishing.md`：手动推送与 Actions 两条路径、PAT 权限、架构确认、NAS 侧拉取与排查。
 - [x] 首次推送到 <https://github.com/xs-www/TsController>（`main` = `d0e29cd`，59 文件）。
-- [ ] **工作流尚未真实跑过** —— 可以用 `git tag v0.1.0 && git push origin v0.1.0` 触发，或在 Actions 页面手动 Run workflow。
+- [x] **工作流已真实跑通（2026-10-17）**：`git tag v0.2.0 && git push origin v0.2.0` 触发
+  <https://github.com/xs-www/TsController/actions/runs/38980923115> —— `verify`（lint + test）与
+  `build-and-push` 两个 job **全部成功**，镜像已推送到 GHCR。
+  - 产物标签：`ghcr.io/xs-www/tscontroller:0.2.0` / `:0.2` / `:latest` / `:sha-9b21c36`，平台 `linux/amd64`。
+  - **包默认私有**：NAS 上拉取前需 `docker login ghcr.io`（用户名 + PAT，`read:packages` 即可）；
+    想公开去 Package 设置里改可见性。
+  - 上游前提：`v0.2.0` 之前的镜像来自一次手动 dispatch（2026-10-16，同样成功）。
 - [ ] NAS 架构确认：`uname -m`。绿联 DX4600 Pro 及其同代机型应为 x86_64，但**以实际输出为准**——架构错了镜像拉下来会 `exec format error`。
 
 ### 2.6 公开仓库里的个人信息（待你决定收尾）
