@@ -740,14 +740,10 @@ Vite 6 + React 19 + TypeScript，无 UI 框架，纯手写 CSS。构建产物 `w
 
 处理方式：13 个文件、约 90 处替换，**改写提交后强推**（`415c65e` → `d0e29cd`），而不是补一个提交把旧值留在历史里。
 
-| 原值 | 替换为 |
-| --- | --- |
-| `sisi-laptop` | `my-laptop` |
-| `Sisi-Laptop` | `My-Laptop` |
-| `tail921448` | `example-tailnet` |
-| `100.72.255.29` | `100.101.102.103` |
-| `fd7a:115c:a1e0::2101:ffb9` | `fd7a:115c:a1e0::9999` |
-| `D:\桌面\sisi_apps\TsController` | `D:\apps\TsController` |
+替换覆盖四类：**主机名**、**tailnet 标识**、**tailnet IPv4/IPv6**、**开发机绝对路径**，分别换成占位值 `my-laptop` / `example-tailnet` / `100.101.102.103`（IPv6 用 `fd7a:115c:a1e0::9999`）/ `D:\apps\TsController`。
+
+> 本文件**刻意不列出被替换的原值**——在公开仓库里记录「原值 → 占位值」的对照表，等于把刚抹掉的东西又写回去。
+> 第一次提交这份归档时就是这么干的，随后被自己的残留扫描逮到。归档只描述类别，不复现内容。
 
 注意：`git grep -l <pattern> HEAD` 会给每条路径加 `HEAD:` 前缀，直接拿去 `Resolve-Path` 会全部失败——第一次尝试因此一个字都没改。要用不带 revision 的 `git grep -l` 搜工作区。
 
